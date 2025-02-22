@@ -1,22 +1,18 @@
 var inProgress = {};
 
-// var dataWebpackPrefix = "webpack:";
+$UNIQUE_PREFIX$
 // loadScript function to load a script via script tag
-__webpack_require__.l = function loadScript(url, done, key, chunkId) {
-	// TODO add this after hash
-	// if (inProgress[url]) {
-	// 	inProgress[url].push(done);
-	// 	return;
-	// }
+__webpack_require__.l = function (url, done, key, chunkId$FETCH_PRIORITY$) {
+	if (inProgress[url]) {
+		inProgress[url].push(done);
+		return;
+	}
 	var script, needAttach;
 	if (key !== undefined) {
 		var scripts = document.getElementsByTagName("script");
 		for (var i = 0; i < scripts.length; i++) {
 			var s = scripts[i];
-			if (
-				s.getAttribute("src") == url
-				// || s.getAttribute("data-webpack") == dataWebpackPrefix + key
-			) {
+			if ($UNIQUE_GET_ATTRIBUTE$) {
 				script = s;
 				break;
 			}
@@ -24,16 +20,7 @@ __webpack_require__.l = function loadScript(url, done, key, chunkId) {
 	}
 	if (!script) {
 		needAttach = true;
-		script = document.createElement("script");
-
-		script.charset = "utf-8";
-		script.timeout = 120;
-		// script.setAttribute("data-webpack", dataWebpackPrefix + key);
-		script.src = $URL$;
-
-		if (__CROSS_ORIGIN_LOADING_PLACEHOLDER__ && script.src.indexOf(window.location.origin + '/') !== 0) {
-			script.crossOrigin = __CROSS_ORIGIN_LOADING_PLACEHOLDER__;
-		}
+		$CREATE_SCRIPT$
 	}
 	inProgress[url] = [done];
 	var onScriptComplete = function (prev, event) {
@@ -50,10 +37,10 @@ __webpack_require__.l = function loadScript(url, done, key, chunkId) {
 	};
 	var timeout = setTimeout(
 		onScriptComplete.bind(null, undefined, {
-			type: "timeout",
+			type: 'timeout',
 			target: script
 		}),
-		120000
+		$CHUNK_LOAD_TIMEOUT$
 	);
 	script.onerror = onScriptComplete.bind(null, script.onerror);
 	script.onload = onScriptComplete.bind(null, script.onload);

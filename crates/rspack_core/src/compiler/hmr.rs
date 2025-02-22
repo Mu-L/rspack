@@ -1,472 +1,264 @@
-use std::{
-  hash::{Hash, Hasher},
-  ops::Sub,
-  path::PathBuf,
-};
+use std::path::Path;
 
-use rayon::prelude::*;
+use rayon::iter::{ParallelBridge, ParallelIterator};
+use rspack_collections::{Identifier, IdentifierMap};
 use rspack_error::Result;
-use rspack_fs::AsyncWritableFileSystem;
-use rspack_identifier::{IdentifierMap, IdentifierSet};
-use rspack_sources::{RawSource, SourceExt};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rspack_hash::RspackHashDigest;
+use rspack_paths::ArcPath;
+use rspack_sources::Source;
+use rustc_hash::FxHashSet as HashSet;
 
 use crate::{
-  fast_set, AssetInfo, Chunk, ChunkKind, Compilation, CompilationAsset, Compiler, ModuleIdentifier,
-  PathData, RenderManifestArgs, RuntimeSpec, SetupMakeParam,
+  chunk_graph_chunk::ChunkId, chunk_graph_module::ModuleId, fast_set,
+  incremental::IncrementalPasses, ChunkGraph, ChunkKind, Compilation, Compiler, ModuleExecutor,
+  RuntimeSpec,
 };
 
-#[derive(Default)]
-struct HotUpdateContent {
-  runtime: RuntimeSpec,
-  updated_chunk_ids: HashSet<String>,
-  removed_chunk_ids: HashSet<String>,
-  _removed_modules: IdentifierSet,
-}
-
-impl HotUpdateContent {
-  fn new(runtime: RuntimeSpec) -> Self {
-    Self {
-      runtime,
-      ..Default::default()
-    }
-  }
-}
-
-impl<T> Compiler<T>
-where
-  T: AsyncWritableFileSystem + Send + Sync,
-{
-  // TODO: remove this function when we had `record` in compiler.
+impl Compiler {
+  #[tracing::instrument("Compiler:rebuild", skip_all, fields(
+    compiler.changed_files = ?changed_files.iter().cloned().collect::<Vec<_>>(),
+    compiler.deleted_files = ?deleted_files.iter().cloned().collect::<Vec<_>>()
+  ))]
   pub async fn rebuild(
     &mut self,
     changed_files: std::collections::HashSet<String>,
-    removed_files: std::collections::HashSet<String>,
+    deleted_files: std::collections::HashSet<String>,
   ) -> Result<()> {
-    assert!(!changed_files.is_empty() || !removed_files.is_empty());
     let old = self.compilation.get_stats();
     let old_hash = self.compilation.hash.clone();
-    fn collect_changed_modules(
-      compilation: &Compilation,
-    ) -> (IdentifierMap<(u64, String)>, IdentifierMap<String>) {
-      let modules_map = compilation
-        .chunk_graph
-        .chunk_graph_module_by_module_identifier
-        .par_iter()
-        .filter_map(|(identifier, cgm)| {
-          let module_hash = compilation.module_graph.get_module_hash(identifier);
-          let cid = cgm.id.as_deref();
-          if let Some(module_hash) = module_hash && let Some(cid) = cid {
-              Some((
-                  *identifier,
-                  (
-                      module_hash,
-                      cid.to_string(),
-                  ),
-              ))
-          } else {
-              None
-          }
-        })
-        .collect::<IdentifierMap<_>>();
 
-      let old_runtime_modules = compilation
-        .runtime_modules
-        .iter()
-        .map(|(identifier, module)| {
-          (
-            *identifier,
-            module.generate(compilation).source().to_string(),
-          )
-        })
-        .collect();
-
-      (modules_map, old_runtime_modules)
-    }
-
-    let (old_all_modules, old_runtime_modules) = collect_changed_modules(old.compilation);
+    let (old_all_modules, old_runtime_modules) = collect_changed_modules(old.compilation)?;
     // TODO: should use `records`
 
-    let mut all_old_runtime: RuntimeSpec = Default::default();
-    for entrypoint_ukey in old.compilation.entrypoints.values() {
-      if let Some(runtime) = old
-        .compilation
-        .chunk_group_by_ukey
-        .get(entrypoint_ukey)
-        .map(|entrypoint| entrypoint.runtime.clone())
-      {
-        all_old_runtime.extend(runtime);
+    let all_old_runtime = old
+      .compilation
+      .get_chunk_graph_entries()
+      .filter_map(|entry_ukey| old.compilation.chunk_by_ukey.get(&entry_ukey))
+      .flat_map(|entry_chunk| entry_chunk.runtime().clone())
+      .collect();
+
+    let mut old_chunks: Vec<(ChunkId, RuntimeSpec)> = vec![];
+    for (_, chunk) in old.compilation.chunk_by_ukey.iter() {
+      if chunk.kind() != ChunkKind::HotUpdate {
+        old_chunks.push((
+          chunk.expect_id(&old.compilation.chunk_ids_artifact).clone(),
+          chunk.runtime().clone(),
+        ));
       }
     }
 
-    let mut hot_update_main_content_by_runtime = all_old_runtime
-      .iter()
-      .map(|runtime| {
-        (
-          runtime.to_string(),
-          HotUpdateContent::new(HashSet::from_iter([runtime.clone()])),
-        )
-      })
-      .collect::<HashMap<String, HotUpdateContent>>();
-
-    let mut old_chunks: Vec<(String, IdentifierSet, RuntimeSpec)> = vec![];
-    for (ukey, chunk) in old.compilation.chunk_by_ukey.iter() {
-      let modules = old
-        .compilation
-        .chunk_graph
-        .get_chunk_graph_chunk(ukey)
-        .modules
-        .clone();
-      old_chunks.push((
-        chunk.expect_id().to_string(),
-        modules,
-        chunk.runtime.clone(),
-      ));
-    }
+    let records = CompilationRecords {
+      old_chunks,
+      all_old_runtime,
+      old_all_modules,
+      old_runtime_modules,
+      old_hash,
+    };
 
     // build without stats
     {
-      let mut modified_files = HashSet::default();
-      modified_files.extend(changed_files.iter().map(PathBuf::from));
-      modified_files.extend(removed_files.iter().map(PathBuf::from));
+      let mut modified_files: HashSet<ArcPath> = HashSet::default();
+      modified_files.extend(changed_files.iter().map(|files| Path::new(files).into()));
+      let mut removed_files: HashSet<ArcPath> = HashSet::default();
+      removed_files.extend(deleted_files.iter().map(|files| Path::new(files).into()));
 
-      self.cache.end_idle();
-      self
-        .cache
-        .set_modified_files(modified_files.iter().cloned().collect::<Vec<_>>());
-      self
-        .plugin_driver
-        .read()
-        .await
-        .resolver_factory
-        .clear_entries();
+      let mut all_files = modified_files.clone();
+      all_files.extend(removed_files.clone());
+
+      self.old_cache.end_idle();
+      // self
+      //   .old_cache
+      //   .set_modified_files(all_files.into_iter().collect());
+
+      self.plugin_driver.clear_cache();
 
       let mut new_compilation = Compilation::new(
-        // TODO: use Arc<T> instead
+        self.id,
         self.options.clone(),
-        self.options.entry.clone(),
-        Default::default(),
         self.plugin_driver.clone(),
+        self.buildtime_plugin_driver.clone(),
         self.resolver_factory.clone(),
+        self.loader_resolver_factory.clone(),
+        Some(records),
         self.cache.clone(),
+        self.old_cache.clone(),
+        Some(ModuleExecutor::default()),
+        modified_files,
+        removed_files,
+        self.input_filesystem.clone(),
+        self.intermediate_filesystem.clone(),
+        self.output_filesystem.clone(),
       );
 
-      let is_incremental_rebuild = self.options.is_incremental_rebuild();
-      if is_incremental_rebuild {
+      new_compilation.hot_index = self.compilation.hot_index + 1;
+
+      if let Some(mutations) = new_compilation.incremental.mutations_write()
+        && let Some(old_mutations) = self.compilation.incremental.mutations_write()
+      {
+        mutations.swap_modules_with_chunk_graph_cache(old_mutations);
+      }
+      if new_compilation
+        .incremental
+        .can_read_mutations(IncrementalPasses::MAKE)
+      {
         // copy field from old compilation
         // make stage used
-        new_compilation.module_graph = std::mem::take(&mut self.compilation.module_graph);
-        new_compilation.make_failed_dependencies =
-          std::mem::take(&mut self.compilation.make_failed_dependencies);
-        new_compilation.make_failed_module =
-          std::mem::take(&mut self.compilation.make_failed_module);
-        new_compilation.entry_dependencies =
-          std::mem::take(&mut self.compilation.entry_dependencies);
-        new_compilation.lazy_visit_modules =
-          std::mem::take(&mut self.compilation.lazy_visit_modules);
-        new_compilation.file_dependencies = std::mem::take(&mut self.compilation.file_dependencies);
-        new_compilation.context_dependencies =
-          std::mem::take(&mut self.compilation.context_dependencies);
-        new_compilation.missing_dependencies =
-          std::mem::take(&mut self.compilation.missing_dependencies);
-        new_compilation.build_dependencies =
-          std::mem::take(&mut self.compilation.build_dependencies);
-        // tree shaking usage start
-        new_compilation.optimize_analyze_result_map =
-          std::mem::take(&mut self.compilation.optimize_analyze_result_map);
-        new_compilation.entry_module_identifiers =
-          std::mem::take(&mut self.compilation.entry_module_identifiers);
-        new_compilation.bailout_module_identifiers =
-          std::mem::take(&mut self.compilation.bailout_module_identifiers);
-        // tree shaking usage end
+        self
+          .compilation
+          .swap_make_artifact_with_compilation(&mut new_compilation);
 
         // seal stage used
         new_compilation.code_splitting_cache =
           std::mem::take(&mut self.compilation.code_splitting_cache);
-      } else {
-        new_compilation.setup_entry_dependencies();
+
+        // reuse module executor
+        new_compilation.module_executor = std::mem::take(&mut self.compilation.module_executor);
+      }
+      if new_compilation
+        .incremental
+        .can_read_mutations(IncrementalPasses::INFER_ASYNC_MODULES)
+      {
+        new_compilation.async_modules_artifact =
+          std::mem::take(&mut self.compilation.async_modules_artifact);
+      }
+      if new_compilation
+        .incremental
+        .can_read_mutations(IncrementalPasses::DEPENDENCIES_DIAGNOSTICS)
+      {
+        new_compilation.dependencies_diagnostics_artifact =
+          std::mem::take(&mut self.compilation.dependencies_diagnostics_artifact);
+      }
+      if new_compilation
+        .incremental
+        .can_read_mutations(IncrementalPasses::SIDE_EFFECTS)
+      {
+        new_compilation.side_effects_optimize_artifact =
+          std::mem::take(&mut self.compilation.side_effects_optimize_artifact);
+      }
+      if new_compilation
+        .incremental
+        .can_read_mutations(IncrementalPasses::MODULE_IDS)
+      {
+        new_compilation.module_ids_artifact =
+          std::mem::take(&mut self.compilation.module_ids_artifact);
+      }
+      if new_compilation
+        .incremental
+        .can_read_mutations(IncrementalPasses::CHUNK_IDS)
+      {
+        new_compilation.chunk_ids_artifact =
+          std::mem::take(&mut self.compilation.chunk_ids_artifact);
+      }
+      if new_compilation
+        .incremental
+        .can_read_mutations(IncrementalPasses::MODULES_HASHES)
+      {
+        new_compilation.cgm_hash_artifact = std::mem::take(&mut self.compilation.cgm_hash_artifact);
+      }
+      if new_compilation
+        .incremental
+        .can_read_mutations(IncrementalPasses::MODULES_CODEGEN)
+      {
+        new_compilation.code_generation_results =
+          std::mem::take(&mut self.compilation.code_generation_results);
+      }
+      if new_compilation
+        .incremental
+        .can_read_mutations(IncrementalPasses::MODULES_RUNTIME_REQUIREMENTS)
+      {
+        new_compilation.cgm_runtime_requirements_artifact =
+          std::mem::take(&mut self.compilation.cgm_runtime_requirements_artifact);
+      }
+      if new_compilation
+        .incremental
+        .can_read_mutations(IncrementalPasses::CHUNKS_RUNTIME_REQUIREMENTS)
+      {
+        new_compilation.cgc_runtime_requirements_artifact =
+          std::mem::take(&mut self.compilation.cgc_runtime_requirements_artifact);
+      }
+      if new_compilation
+        .incremental
+        .can_read_mutations(IncrementalPasses::CHUNKS_HASHES)
+      {
+        new_compilation.chunk_hashes_artifact =
+          std::mem::take(&mut self.compilation.chunk_hashes_artifact);
+      }
+      if new_compilation
+        .incremental
+        .can_read_mutations(IncrementalPasses::CHUNKS_RENDER)
+      {
+        new_compilation.chunk_render_artifact =
+          std::mem::take(&mut self.compilation.chunk_render_artifact);
       }
 
+      // FOR BINDING SAFETY:
+      // Update `compilation` for each rebuild.
+      // Make sure `thisCompilation` hook was called before any other hooks that leverage `JsCompilation`.
       fast_set(&mut self.compilation, new_compilation);
-
-      self.compilation.lazy_visit_modules = changed_files.clone();
-
-      // Fake this compilation as *currently* rebuilding does not create a new compilation
-      self
-        .plugin_driver
-        .write()
-        .await
-        .this_compilation(&mut self.compilation)
-        .await?;
-
-      self
-        .plugin_driver
-        .write()
-        .await
-        .compilation(&mut self.compilation)
-        .await?;
-
-      let setup_make_params = if is_incremental_rebuild {
-        SetupMakeParam::ModifiedFiles(modified_files)
-      } else {
-        let deps = self
-          .compilation
-          .entry_dependencies
-          .iter()
-          .flat_map(|(_, deps)| {
-            deps
-              .clone()
-              .into_iter()
-              .map(|d| (d, None))
-              .collect::<Vec<_>>()
-          })
-          .collect::<HashSet<_>>();
-        SetupMakeParam::ForceBuildDeps(deps)
-      };
-      self.compile(setup_make_params).await?;
-      self.cache.begin_idle();
-    }
-
-    // ----
-    if hot_update_main_content_by_runtime.is_empty() {
-      self.compile_done().await?;
-      return Ok(());
-    }
-
-    let (now_all_modules, now_runtime_modules) = collect_changed_modules(&self.compilation);
-
-    let mut updated_modules: IdentifierSet = Default::default();
-    let mut updated_runtime_modules: IdentifierSet = Default::default();
-    let mut completely_removed_modules: HashSet<String> = Default::default();
-
-    for (old_uri, (old_hash, old_module_id)) in &old_all_modules {
-      if let Some((now_hash, _)) = now_all_modules.get(old_uri) {
-        // updated
-        if now_hash != old_hash {
-          updated_modules.insert(*old_uri);
-        }
-      } else {
-        // deleted
-        completely_removed_modules.insert(old_module_id.to_string());
+      if let Err(err) = self.cache.before_compile(&mut self.compilation).await {
+        self.compilation.push_diagnostic(err.into());
       }
-    }
-    for identifier in now_all_modules.keys() {
-      if !old_all_modules.contains_key(identifier) {
-        // added
-        updated_modules.insert(*identifier);
-      }
-    }
+      self.compile().await?;
 
-    // println!(
-    //   "updated_modules: {:?}\n, remove modules {:?}",
-    //   updated_modules, completely_removed_modules
-    // );
-
-    for (identifier, old_runtime_module_content) in &old_runtime_modules {
-      if let Some(new_runtime_module_content) = now_runtime_modules.get(identifier) {
-        // updated
-        if new_runtime_module_content != old_runtime_module_content {
-          updated_runtime_modules.insert(*identifier);
-        }
-      }
-    }
-    for identifier in now_runtime_modules.keys() {
-      if !old_runtime_modules.contains_key(identifier) {
-        // added
-        updated_runtime_modules.insert(*identifier);
-      }
-    }
-
-    // TODO: hash
-    // if old.hash == now.hash { return  } else { // xxxx}
-
-    for (chunk_id, _old_chunk_modules, old_runtime) in &old_chunks {
-      let mut new_modules = vec![];
-      let mut new_runtime_modules = vec![];
-      let mut chunk_id = chunk_id.to_string();
-      let mut new_runtime = all_old_runtime.clone();
-      let mut removed_from_runtime = all_old_runtime.clone();
-      let current_chunk = self
-        .compilation
-        .chunk_by_ukey
-        .iter()
-        .find(|(_, chunk)| chunk.expect_id().eq(&chunk_id))
-        .map(|(_, chunk)| chunk);
-
-      if let Some(current_chunk) = current_chunk {
-        chunk_id = current_chunk.expect_id().to_string();
-        new_runtime = Default::default();
-        // intersectRuntime
-        for old_runtime in &all_old_runtime {
-          if current_chunk.runtime.contains(old_runtime) {
-            new_runtime.insert(old_runtime.clone());
-          }
-        }
-        // ------
-        if new_runtime.is_empty() {
-          continue;
-        }
-
-        new_modules = self
-          .compilation
-          .chunk_graph
-          .get_chunk_graph_chunk(&current_chunk.ukey)
-          .modules
-          .iter()
-          .filter_map(|module| updated_modules.contains(module).then_some(*module))
-          .collect::<Vec<_>>();
-
-        new_runtime_modules = self
-          .compilation
-          .chunk_graph
-          .get_chunk_runtime_modules_in_order(&current_chunk.ukey)
-          .iter()
-          .filter_map(|module| {
-            updated_runtime_modules
-              .contains(module)
-              .then(|| ModuleIdentifier::from(module.as_str()))
-          })
-          .collect::<Vec<_>>();
-
-        // subtractRuntime
-        removed_from_runtime = removed_from_runtime.sub(&new_runtime);
-      } else {
-        removed_from_runtime = old_runtime.clone();
-        // new_runtime = old_runtime.clone();
-      }
-
-      for removed in removed_from_runtime {
-        if let Some(info) = hot_update_main_content_by_runtime.get_mut(removed.as_ref()) {
-          info.removed_chunk_ids.insert(chunk_id.to_string());
-        }
-        // TODO:
-        // for (const module of remainingModules) {}
-      }
-
-      if !new_modules.is_empty() || !new_runtime_modules.is_empty() {
-        let mut hot_update_chunk = Chunk::new(
-          Some(chunk_id.to_string()),
-          Some(chunk_id.to_string()),
-          ChunkKind::HotUpdate,
-        );
-        hot_update_chunk.runtime = new_runtime.clone();
-        let ukey = hot_update_chunk.ukey;
-        if let Some(current_chunk) = current_chunk {
-          current_chunk
-            .groups
-            .iter()
-            .for_each(|group| hot_update_chunk.add_group(*group))
-        }
-
-        for module_identifier in new_modules.iter() {
-          if let Some(module) = self
-            .compilation
-            .module_graph
-            .module_by_identifier(module_identifier)
-          {
-            module.hash(&mut hot_update_chunk.hash);
-          }
-        }
-        let hash = format!("{:016x}", hot_update_chunk.hash.finish());
-        hot_update_chunk
-          .content_hash
-          .insert(crate::SourceType::JavaScript, hash.clone());
-        hot_update_chunk
-          .content_hash
-          .insert(crate::SourceType::Css, hash);
-
-        self.compilation.chunk_by_ukey.add(hot_update_chunk);
-        self.compilation.chunk_graph.add_chunk(ukey);
-
-        for module_identifier in new_modules.iter() {
-          self
-            .compilation
-            .chunk_graph
-            .connect_chunk_and_module(ukey, *module_identifier);
-        }
-
-        for runtime_module in new_runtime_modules {
-          self
-            .compilation
-            .chunk_graph
-            .connect_chunk_and_runtime_module(ukey, runtime_module);
-        }
-
-        let render_manifest = self
-          .compilation
-          .plugin_driver
-          .read()
-          .await
-          .render_manifest(RenderManifestArgs {
-            compilation: &self.compilation,
-            chunk_ukey: ukey,
-          })
-          .await
-          .expect("render_manifest failed in rebuild");
-
-        for entry in render_manifest {
-          let asset = CompilationAsset::new(
-            Some(entry.source),
-            entry.info.with_hot_module_replacement(true),
-          );
-
-          let chunk = self
-            .compilation
-            .chunk_by_ukey
-            .get(&ukey)
-            .expect("should have update chunk");
-          let filename = self.compilation.get_path(
-            &self.compilation.options.output.hot_update_chunk_filename,
-            PathData::default().chunk(chunk).hash(&old_hash),
-          );
-          self.compilation.emit_asset(filename, asset);
-        }
-
-        new_runtime.iter().for_each(|runtime| {
-          if let Some(info) = hot_update_main_content_by_runtime.get_mut(runtime.as_ref()) {
-            info.updated_chunk_ids.insert(chunk_id.to_string());
-          }
-        });
-      }
-    }
-
-    let completely_removed_modules_array: Vec<String> =
-      completely_removed_modules.into_iter().collect();
-
-    for (_, content) in hot_update_main_content_by_runtime {
-      let c: Vec<String> = content.updated_chunk_ids.into_iter().collect();
-      let r: Vec<String> = content.removed_chunk_ids.into_iter().collect();
-      let m: Vec<String> = completely_removed_modules_array
-        .iter()
-        .map(|x| x.to_owned())
-        .collect();
-      let filename = self.compilation.get_path(
-        &self.compilation.options.output.hot_update_main_filename,
-        PathData::default()
-          .runtime(&content.runtime)
-          .hash(&old_hash),
-      );
-      self.compilation.emit_asset(
-        filename,
-        CompilationAsset::new(
-          Some(
-            RawSource::Source(
-              serde_json::json!({
-                "c": c,
-                "r": r,
-                "m": m,
-              })
-              .to_string(),
-            )
-            .boxed(),
-          ),
-          AssetInfo::default().with_hot_module_replacement(true),
-        ),
-      );
+      self.old_cache.begin_idle();
     }
 
     self.compile_done().await?;
+    if let Err(err) = self.cache.after_compile(&self.compilation).await {
+      self.compilation.push_diagnostic(err.into());
+    }
 
     Ok(())
   }
+}
+
+#[derive(Debug)]
+pub struct CompilationRecords {
+  pub old_chunks: Vec<(ChunkId, RuntimeSpec)>,
+  pub all_old_runtime: RuntimeSpec,
+  pub old_all_modules: IdentifierMap<(RspackHashDigest, ModuleId)>,
+  pub old_runtime_modules: IdentifierMap<String>,
+  pub old_hash: Option<RspackHashDigest>,
+}
+
+pub type ChangedModules = (
+  IdentifierMap<(RspackHashDigest, ModuleId)>,
+  IdentifierMap<String>,
+);
+pub fn collect_changed_modules(compilation: &Compilation) -> Result<ChangedModules> {
+  let modules_map = compilation
+    .chunk_graph
+    .chunk_graph_module_by_module_identifier
+    .keys()
+    .par_bridge()
+    .filter_map(|identifier| {
+      let cid = ChunkGraph::get_module_id(&compilation.module_ids_artifact, *identifier);
+      // TODO: Determine how to calc module hash if module related to multiple runtime code
+      // gen
+      if let Some(code_generation_result) = compilation.code_generation_results.get_one(identifier)
+        && let Some(module_hash) = &code_generation_result.hash
+        && let Some(cid) = cid
+      {
+        Some((*identifier, (module_hash.clone(), cid.clone())))
+      } else {
+        None
+      }
+    })
+    .collect::<IdentifierMap<_>>();
+
+  let old_runtime_modules = compilation
+    .runtime_modules
+    .iter()
+    .map(|(identifier, module)| -> Result<(Identifier, String)> {
+      Ok((
+        *identifier,
+        module
+          .generate_with_custom(compilation)?
+          .source()
+          .to_string(),
+      ))
+    })
+    .collect::<Result<IdentifierMap<String>>>()?;
+
+  Ok((modules_map, old_runtime_modules))
 }

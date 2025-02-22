@@ -1,0 +1,142 @@
+import WebpackLicense from '@components/WebpackLicense';
+import PropertyType from '@components/PropertyType';
+
+<WebpackLicense from="https://webpack.js.org/configuration/other-options/" />
+
+# 其他配置
+
+这里展示了 Rspack 支持的其余配置项。
+
+## amd
+
+<PropertyType type="false | object" />
+
+设置 `require.amd` 或 `define.amd` 的值。设置 `amd` 为 `false` 会禁用 Rspack 的 AMD 支持。
+
+```js title="rspack.config.mjs"
+export default {
+  amd: {
+    jQuery: true,
+  },
+};
+```
+
+## bail
+
+<PropertyType type="boolean" defaultValueList={[{ defaultValue: 'false' }]} />
+
+遇到第一个错误时退出。Rspack 在默认情况下会在命令行以及在 HMR 时的浏览器 console 中打印这些错误，并且继续编译。
+
+```js title="rspack.config.mjs"
+export default {
+  bail: true,
+};
+```
+
+这会强制 Rspack 终止编译流程。
+
+## dependencies
+
+<PropertyType
+  type="string[]"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
+
+定义当前配置依赖的所有相邻配置的 [name](#name)。依赖的配置需要先编译完成。
+
+在 watch 模式下，当以下情况发生时，依赖关系将使编译器无效：
+
+1. 依赖的配置已更改。
+2. 依赖的配置正在编译中或无效。
+
+请记住，当前配置在其依赖项完成之前不会编译。
+
+```js title="rspack.config.mjs"
+export default [
+  {
+    name: 'client',
+    target: 'web',
+    // …
+  },
+  {
+    name: 'server',
+    target: 'node',
+    dependencies: ['client'],
+  },
+];
+```
+
+## ignoreWarnings
+
+<PropertyType
+  type="(RegExp | ((warning: Error, Compilation: Compilation) => boolean))[]"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
+
+告知 Rspack 忽略特定的警告。
+
+```js title="rspack.config.mjs"
+export default {
+  //...
+  ignoreWarnings: [/warning from compiler/, warning => true],
+};
+```
+
+## name
+
+<PropertyType
+  type="string"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
+
+配置的名称。当加载多个配置时被使用。
+
+```js title="rspack.config.mjs"
+export default {
+  //...
+  name: 'admin-app',
+};
+```
+
+### loader
+
+<PropertyType
+  type="Record<string, any>"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
+
+将自定义值添加到 [Loader 上下文](/api/loader-api/context)。
+
+如下示例在 Loader 上下问中定义了一个新变量 `answer`：
+
+```js title="rspack.config.mjs"
+export default {
+  // ...
+  loader: {
+    answer: 42,
+  },
+};
+```
+
+通过 `this.answer` 在 Loader 中获取该变量：
+
+```js title=custom-loader.js
+module.exports = function (source) {
+  // ...
+  console.log(this.answer); // 打印 `42`
+  return source;
+};
+```
+
+:::tip
+你可以覆盖 Loader 上下文中的属性，因为 Rspack 会将所有定义在 Loader 中的属性负责到 Loader 上下文中。
+:::
+
+## profile
+
+<PropertyType
+  type="boolean"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
+
+捕获构建的分析和提示数据，供分析工具消费。它会尽可能详细的打印模块的耗时信息。

@@ -1,6 +1,7 @@
-import { Colorette } from "colorette";
-import { RspackCLI } from "./rspack-cli";
 import type { DevServer } from "@rspack/core";
+import type { Colorette } from "colorette";
+
+import type { RspackCLI } from "./cli";
 export type { Configuration } from "@rspack/core";
 
 export interface IRspackCLI {
@@ -23,6 +24,7 @@ export interface RspackCLIOptions {
 	config?: string;
 	argv?: Record<string, any>;
 	configName?: string[];
+	"config-loader"?: string;
 }
 
 export interface RspackBuildCLIOptions extends RspackCLIOptions {
@@ -31,8 +33,10 @@ export interface RspackBuildCLIOptions extends RspackCLIOptions {
 	mode?: string;
 	watch?: boolean;
 	analyze?: boolean;
+	profile?: boolean;
 	env?: Record<string, any>;
 	nodeEnv?: string;
+	"output-path"?: string;
 }
 
 export interface RspackPreviewCLIOptions extends RspackCLIOptions {
@@ -41,7 +45,7 @@ export interface RspackPreviewCLIOptions extends RspackCLIOptions {
 	host?: string;
 	open?: boolean;
 	server?: string;
-	publicPath: string;
+	publicPath?: string;
 }
 export interface RspackCommand {
 	apply(cli: RspackCLI): Promise<void>;

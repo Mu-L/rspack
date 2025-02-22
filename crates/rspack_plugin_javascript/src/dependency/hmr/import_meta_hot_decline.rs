@@ -1,54 +1,57 @@
+use rspack_cacheable::{cacheable, cacheable_dyn, with::AsPreset};
 use rspack_core::{
-  create_javascript_visitor, CodeGeneratable, CodeGeneratableContext, CodeGeneratableResult,
-  Dependency, DependencyCategory, DependencyId, DependencyType, ErrorSpan, JsAstPath,
-  ModuleDependency,
+  module_id, AsContextDependency, Compilation, Dependency, DependencyCategory, DependencyId,
+  DependencyRange, DependencyTemplate, DependencyType, FactorizeInfo, ModuleDependency,
+  RuntimeSpec, TemplateContext, TemplateReplaceSource,
 };
-use swc_core::ecma::atoms::{Atom, JsWord};
+use swc_core::ecma::atoms::Atom;
 
+#[cacheable]
 #[derive(Debug, Clone)]
-pub struct ImportMetaModuleHotDeclineDependency {
-  id: Option<DependencyId>,
-  request: JsWord,
-  // user_request: String,
-  category: &'static DependencyCategory,
-  dependency_type: &'static DependencyType,
-
-  span: Option<ErrorSpan>,
-  #[allow(unused)]
-  ast_path: JsAstPath,
+pub struct ImportMetaHotDeclineDependency {
+  id: DependencyId,
+  #[cacheable(with=AsPreset)]
+  request: Atom,
+  range: DependencyRange,
+  factorize_info: FactorizeInfo,
 }
 
-impl ImportMetaModuleHotDeclineDependency {
-  pub fn new(request: JsWord, span: Option<ErrorSpan>, ast_path: JsAstPath) -> Self {
+impl ImportMetaHotDeclineDependency {
+  pub fn new(request: Atom, range: DependencyRange) -> Self {
     Self {
       request,
-      category: &DependencyCategory::Esm,
-      dependency_type: &DependencyType::ImportMetaHotDecline,
-      span,
-      ast_path,
-      id: Default::default(),
+      range,
+      id: DependencyId::new(),
+      factorize_info: Default::default(),
     }
   }
 }
 
-impl Dependency for ImportMetaModuleHotDeclineDependency {
-  fn id(&self) -> Option<DependencyId> {
-    self.id
-  }
-  fn set_id(&mut self, id: Option<DependencyId>) {
-    self.id = id;
+#[cacheable_dyn]
+impl Dependency for ImportMetaHotDeclineDependency {
+  fn id(&self) -> &DependencyId {
+    &self.id
   }
 
   fn category(&self) -> &DependencyCategory {
-    self.category
+    &DependencyCategory::Esm
   }
 
   fn dependency_type(&self) -> &DependencyType {
-    self.dependency_type
+    &DependencyType::ImportMetaHotDecline
+  }
+
+  fn range(&self) -> Option<&DependencyRange> {
+    Some(&self.range)
+  }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::True
   }
 }
 
-impl ModuleDependency for ImportMetaModuleHotDeclineDependency {
+#[cacheable_dyn]
+impl ModuleDependency for ImportMetaHotDeclineDependency {
   fn request(&self) -> &str {
     &self.request
   }
@@ -57,35 +60,55 @@ impl ModuleDependency for ImportMetaModuleHotDeclineDependency {
     &self.request
   }
 
-  fn span(&self) -> Option<&ErrorSpan> {
-    self.span.as_ref()
+  fn set_request(&mut self, request: String) {
+    self.request = request.into();
+  }
+
+  fn weak(&self) -> bool {
+    true
+  }
+
+  fn factorize_info(&self) -> &FactorizeInfo {
+    &self.factorize_info
+  }
+
+  fn factorize_info_mut(&mut self) -> &mut FactorizeInfo {
+    &mut self.factorize_info
   }
 }
 
-impl CodeGeneratable for ImportMetaModuleHotDeclineDependency {
-  fn generate(
+#[cacheable_dyn]
+impl DependencyTemplate for ImportMetaHotDeclineDependency {
+  fn apply(
     &self,
-    code_generatable_context: &mut CodeGeneratableContext,
-  ) -> rspack_error::Result<CodeGeneratableResult> {
-    let CodeGeneratableContext { compilation, .. } = code_generatable_context;
+    source: &mut TemplateReplaceSource,
+    code_generatable_context: &mut TemplateContext,
+  ) {
+    source.replace(
+      self.range.start,
+      self.range.end,
+      module_id(
+        code_generatable_context.compilation,
+        &self.id,
+        &self.request,
+        self.weak(),
+      )
+      .as_str(),
+      None,
+    );
+  }
 
-    let mut code_gen = CodeGeneratableResult::default();
+  fn dependency_id(&self) -> Option<DependencyId> {
+    Some(self.id)
+  }
 
-    if let Some(id) = self.id() {
-      if let Some(module_id) = compilation
-        .module_graph
-        .module_graph_module_by_dependency_id(&id)
-        .map(|m| m.id(&compilation.chunk_graph).to_string())
-      {
-        code_gen.visitors.push(
-          create_javascript_visitor!(exact &self.ast_path, visit_mut_str(str: &mut Str) {
-            str.value = JsWord::from(&*module_id);
-            str.raw = Some(Atom::from(format!("\"{module_id}\"")));
-          }),
-        );
-      }
-    }
-
-    Ok(code_gen)
+  fn update_hash(
+    &self,
+    _hasher: &mut dyn std::hash::Hasher,
+    _compilation: &Compilation,
+    _runtime: Option<&RuntimeSpec>,
+  ) {
   }
 }
+
+impl AsContextDependency for ImportMetaHotDeclineDependency {}

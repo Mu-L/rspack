@@ -1,46 +1,61 @@
-import yargs from "yargs";
-export const commonOptions = (yargs: yargs.Argv<{}>) => {
-	return yargs.options({
-		config: {
-			g: true,
-			type: "string",
-			describe: "config file",
-			alias: "c"
-		},
-		entry: {
-			type: "array",
-			string: true,
-			describe: "entry file"
-		},
-		mode: { type: "string", describe: "mode" },
-		watch: {
-			type: "boolean",
-			default: false,
-			describe: "watch"
-		},
-		env: {
-			type: "array",
-			string: true,
-			describe: "env passed to config function"
-		},
-		"node-env": {
-			string: true,
-			describe: "sets process.env.NODE_ENV to be specified value"
-		},
-		devtool: {
-			type: "boolean",
-			default: false,
-			describe: "devtool"
-		},
-		configName: {
-			type: "array",
-			string: true,
-			describe: "Name of the configuration to use."
-		}
-	});
+import type yargs from "yargs";
+export const commonOptions = (yargs: yargs.Argv) => {
+	return yargs
+		.options({
+			config: {
+				g: true,
+				type: "string",
+				describe: "config file",
+				alias: "c"
+			},
+			entry: {
+				type: "array",
+				string: true,
+				describe: "entry file"
+			},
+			"output-path": {
+				type: "string",
+				describe: "output path dir",
+				alias: "o"
+			},
+			mode: { type: "string", describe: "mode", alias: "m" },
+			watch: {
+				type: "boolean",
+				default: false,
+				describe: "watch",
+				alias: "w"
+			},
+			env: {
+				type: "array",
+				string: true,
+				describe: "env passed to config function"
+			},
+			"node-env": {
+				string: true,
+				describe: "sets process.env.NODE_ENV to be specified value"
+			},
+			devtool: {
+				type: "boolean",
+				default: false,
+				describe: "devtool",
+				alias: "d"
+			},
+			configName: {
+				type: "array",
+				string: true,
+				describe: "Name of the configuration to use."
+			},
+			"config-loader": {
+				type: "string",
+				default: "register",
+				describe:
+					"Specify the loader to load the config file, can be `native` or `register`."
+			}
+		})
+		.alias({ v: "version", h: "help" });
 };
 
-export const previewOptions = (yargs: yargs.Argv<{}>) => {
+export const previewOptions = (yargs: yargs.Argv) => {
 	return yargs
 		.positional("dir", {
 			type: "string",
@@ -82,14 +97,16 @@ export const previewOptions = (yargs: yargs.Argv<{}>) => {
 		});
 };
 
-export function normalizeEnv(argv) {
-	function parseValue(previous, value) {
+export function normalizeEnv(argv: yargs.Arguments) {
+	function parseValue(previous: Record<string, unknown>, value: string) {
 		const [allKeys, val] = value.split(/=(.+)/, 2);
 		const splitKeys = allKeys.split(/\.(?!$)/);
 
 		let prevRef = previous;
 
-		splitKeys.forEach((someKey, index) => {
+		splitKeys.forEach((key, index) => {
+			let someKey = key;
+
 			// https://github.com/webpack/webpack-cli/issues/3284
 			if (someKey.endsWith("=")) {
 				// remove '=' from key
@@ -98,11 +115,7 @@ export function normalizeEnv(argv) {
 				return;
 			}
 
-			if (!prevRef[someKey]) {
-				prevRef[someKey] = {};
-			}
-
-			if (typeof prevRef[someKey] === "string") {
+			if (!prevRef[someKey] || typeof prevRef[someKey] === "string") {
 				prevRef[someKey] = {};
 			}
 
@@ -121,4 +134,43 @@ export function normalizeEnv(argv) {
 	}
 	const envObj = ((argv.env as string[]) ?? []).reduce(parseValue, {});
 	argv.env = envObj;
+}
+
+/**
+ * set builtin env from cli - like `WEBPACK_BUNDLE=true`. also for `RSPACK_` prefixed.
+ * @param env the `argv.env` object
+ * @param envNameSuffix the added env will be `WEBPACK_${envNameSuffix}` and `RSPACK_${envNameSuffix}`
+ * @param value
+ */
+export function setBuiltinEnvArg(
+	env: Record<string, any>,
+	envNameSuffix: string,
+	value: any
+) {
+	const envNames = [
+		// TODO: breaking change
+		// `WEBPACK_${envNameSuffix}`,
+		`RSPACK_${envNameSuffix}`
+	];
+	for (const envName of envNames) {
+		if (envName in env) {
+			continue;
+		}
+		env[envName] = value;
+	}
+}
+
+/**
+ * infer `argv.env` as an object for it was transformed from array to object after `normalizeEnv` middleware
+ * @returns the reference of `argv.env` object
+ */
+export function ensureEnvObject<T extends Record<string, unknown>>(
+	options: yargs.Arguments
+): T {
+	if (Array.isArray(options.env)) {
+		// in case that cli haven't got `normalizeEnv` middleware applied
+		normalizeEnv(options);
+	}
+	options.env = options.env || {};
+	return options.env as T;
 }

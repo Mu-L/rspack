@@ -7,16 +7,18 @@ packages/rspack/src/config/schema.check.js
 # Ignore example fixtures
 
 # Ignore test related
-packages/rspack/tests/fixtures/**/*
-packages/rspack/tests/statsCases/**/*
-packages/rspack/tests/configCases/errors/**/*
-packages/rspack/tests/hotCases/**/*
-packages/rspack/tests/js/**/*
-packages/rspack/tests/copyPlugin/build/**/*
 
-benchcases/**/*
+packages/**/etc/**/*
+packages/rspack-test-tools/template/**/*
+packages/rspack-test-tools/src/helper/legacy/**/*
+packages/rspack-test-tools/tests/**/*.*
+packages/rspack-test-tools/tests/**/DO_NOT_REMOVE
+!packages/rspack-test-tools/tests/**/*.test.ts
+!packages/rspack-test-tools/tests/**/*.test.js
+!packages/rspack-test-tools/tests/**/*.config.js
+
 crates/**/*
 target/**/*
+tests/**/*
 
-webpack-test/**/*
-webpack-examples/**/*
+!tests/**/test.filter.js

@@ -1,55 +1,67 @@
-use rspack_error::Result;
-use swc_core::ecma::ast::Expr;
+use rspack_cacheable::{cacheable, cacheable_dyn, with::AsRefStr};
+use rspack_util::ext::DynHash;
 
 use crate::{
-  create_javascript_visitor, CodeGeneratable, CodeGeneratableContext, CodeGeneratableResult,
-  Dependency, JsAstPath, RuntimeGlobals,
+  AsDependency, Compilation, DependencyTemplate, RuntimeGlobals, RuntimeSpec, TemplateContext,
+  TemplateReplaceSource,
 };
 
-#[derive(Debug, Eq, PartialEq, Clone, Hash)]
+#[cacheable]
+#[derive(Debug, Clone)]
 pub struct ConstDependency {
-  pub expression: Expr,
+  pub start: u32,
+  pub end: u32,
+  #[cacheable(with=AsRefStr)]
+  pub content: Box<str>,
   pub runtime_requirements: Option<RuntimeGlobals>,
-  #[allow(unused)]
-  pub ast_path: JsAstPath,
-}
-
-impl Dependency for ConstDependency {}
-
-impl CodeGeneratable for ConstDependency {
-  fn generate(
-    &self,
-    code_generatable_context: &mut CodeGeneratableContext,
-  ) -> Result<CodeGeneratableResult> {
-    let mut cgr = CodeGeneratableResult::default();
-
-    if let Some(runtime_requirement) = self.runtime_requirements {
-      code_generatable_context
-        .runtime_requirements
-        .insert(runtime_requirement);
-    }
-
-    let expr = self.expression.clone();
-    cgr.visitors.push(
-      create_javascript_visitor!(exact &self.ast_path, visit_mut_expr(n: &mut Expr) {
-        *n = expr.clone();
-      }),
-    );
-
-    Ok(cgr)
-  }
 }
 
 impl ConstDependency {
   pub fn new(
-    expression: Expr,
+    start: u32,
+    end: u32,
+    content: Box<str>,
     runtime_requirements: Option<RuntimeGlobals>,
-    ast_path: JsAstPath,
   ) -> Self {
     Self {
-      expression,
+      start,
+      end,
+      content,
       runtime_requirements,
-      ast_path,
     }
   }
 }
+
+#[cacheable_dyn]
+impl DependencyTemplate for ConstDependency {
+  fn apply(
+    &self,
+    source: &mut TemplateReplaceSource,
+    code_generatable_context: &mut TemplateContext,
+  ) {
+    if let Some(runtime_requirements) = &self.runtime_requirements {
+      code_generatable_context
+        .runtime_requirements
+        .insert(*runtime_requirements);
+    }
+    source.replace(self.start, self.end, self.content.as_ref(), None);
+  }
+
+  fn dependency_id(&self) -> Option<crate::DependencyId> {
+    None
+  }
+
+  fn update_hash(
+    &self,
+    hasher: &mut dyn std::hash::Hasher,
+    _compilation: &Compilation,
+    _runtime: Option<&RuntimeSpec>,
+  ) {
+    self.start.dyn_hash(hasher);
+    self.end.dyn_hash(hasher);
+    self.content.dyn_hash(hasher);
+    self.runtime_requirements.dyn_hash(hasher);
+  }
+}
+
+impl AsDependency for ConstDependency {}

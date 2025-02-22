@@ -3,17 +3,22 @@
   "private": true,
   "version": "1.0.0",
   "scripts": {
-    "dev": "rspack serve",
-    "build": "rspack build"
+    "dev": "cross-env NODE_ENV=development rspack serve",
+    "build": "cross-env NODE_ENV=production rspack build"
   },
   "dependencies": {
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
-    "@rspack/cli": "latest",
-    "@types/react": "18.2.0",
-    "@types/react-dom": "18.2.1",
-    "typescript": "^5.0.4"
+    "@rspack/cli": "workspace:*",
+    "@rspack/core": "workspace:*",
+    "@rspack/plugin-react-refresh": "^1.0.1",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "cross-env": "^7.0.3",
+    "react-refresh": "^0.16.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
   }
 }

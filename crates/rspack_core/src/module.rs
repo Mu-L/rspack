@@ -1,108 +1,275 @@
+use std::fmt::Display;
 use std::hash::Hash;
-use std::path::PathBuf;
+use std::sync::Arc;
 use std::{any::Any, borrow::Cow, fmt::Debug};
 
 use async_trait::async_trait;
-use rspack_error::{IntoTWithDiagnosticArray, Result, TWithDiagnosticArray};
-use rspack_identifier::{Identifiable, Identifier};
-use rspack_sources::Source;
-use rustc_hash::FxHashSet as HashSet;
+use json::JsonValue;
+use rspack_cacheable::with::AsPreset;
+use rspack_cacheable::{
+  cacheable, cacheable_dyn,
+  with::{AsOption, AsVec},
+};
+use rspack_collections::{Identifiable, Identifier, IdentifierSet};
+use rspack_error::{Diagnosable, Result};
+use rspack_fs::ReadableFileSystem;
+use rspack_hash::RspackHashDigest;
+use rspack_paths::ArcPath;
+use rspack_sources::BoxSource;
+use rspack_util::atom::Atom;
+use rspack_util::ext::{AsAny, DynHash};
+use rspack_util::source_map::ModuleSourceMapConfig;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use serde::Serialize;
 
+use crate::concatenated_module::ConcatenatedModule;
+use crate::dependencies_block::dependencies_block_update_hash;
 use crate::{
-  AsAny, CodeGenerationResult, Compilation, CompilerContext, CompilerOptions, Context,
-  ContextModule, Dependency, DynEq, DynHash, ExternalModule, ModuleDependency, ModuleType,
-  NormalModule, RawModule, Resolve, SharedPluginDriver, SourceType,
+  AsyncDependenciesBlock, BoxDependency, ChunkGraph, ChunkUkey, CodeGenerationResult, Compilation,
+  CompilationAsset, CompilationId, CompilerId, CompilerOptions, ConcatenationScope,
+  ConnectionState, Context, ContextModule, DependenciesBlock, DependencyId, DependencyTemplate,
+  ExportInfoProvided, ExternalModule, ModuleDependency, ModuleGraph, ModuleLayer, ModuleType,
+  NormalModule, RawModule, Resolve, ResolverFactory, RuntimeSpec, SelfModule, SharedPluginDriver,
+  SourceType,
 };
 
-pub struct BuildContext<'a> {
-  pub compiler_context: CompilerContext,
+pub struct BuildContext {
+  pub compiler_id: CompilerId,
+  pub compilation_id: CompilationId,
+  pub compiler_options: Arc<CompilerOptions>,
+  pub resolver_factory: Arc<ResolverFactory>,
   pub plugin_driver: SharedPluginDriver,
-  pub compiler_options: &'a CompilerOptions,
+  pub fs: Arc<dyn ReadableFileSystem>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum BuildExtraDataType {
+  CssParserAndGenerator,
+  AssetParserAndGenerator,
+  JavaScriptParserAndGenerator,
+}
+
+#[cacheable]
+#[derive(Debug, Clone)]
 pub struct BuildInfo {
   /// Whether the result is cacheable, i.e shared between builds.
   pub cacheable: bool,
-  pub hash: u64,
+  pub hash: Option<RspackHashDigest>,
   pub strict: bool,
-  pub file_dependencies: HashSet<PathBuf>,
-  pub context_dependencies: HashSet<PathBuf>,
-  pub missing_dependencies: HashSet<PathBuf>,
-  pub build_dependencies: HashSet<PathBuf>,
-  pub asset_filenames: HashSet<String>,
+  pub module_argument: ModuleArgument,
+  pub exports_argument: ExportsArgument,
+  pub file_dependencies: HashSet<ArcPath>,
+  pub context_dependencies: HashSet<ArcPath>,
+  pub missing_dependencies: HashSet<ArcPath>,
+  pub build_dependencies: HashSet<ArcPath>,
+  #[cacheable(with=AsVec<AsPreset>)]
+  pub esm_named_exports: HashSet<Atom>,
+  pub all_star_exports: Vec<DependencyId>,
+  pub need_create_require: bool,
+  #[cacheable(with=AsOption<AsPreset>)]
+  pub json_data: Option<JsonValue>,
+  #[cacheable(with=AsOption<AsVec<AsPreset>>)]
+  pub top_level_declarations: Option<HashSet<Atom>>,
+  pub module_concatenation_bailout: Option<String>,
+  pub assets: HashMap<String, CompilationAsset>,
+  pub module: bool,
 }
 
-#[derive(Debug, Default, Clone)]
+impl Default for BuildInfo {
+  fn default() -> Self {
+    Self {
+      cacheable: true,
+      hash: None,
+      strict: false,
+      module_argument: Default::default(),
+      exports_argument: Default::default(),
+      file_dependencies: HashSet::default(),
+      context_dependencies: HashSet::default(),
+      missing_dependencies: HashSet::default(),
+      build_dependencies: HashSet::default(),
+      esm_named_exports: HashSet::default(),
+      all_star_exports: Vec::default(),
+      need_create_require: false,
+      json_data: None,
+      top_level_declarations: None,
+      module_concatenation_bailout: None,
+      assets: Default::default(),
+      module: false,
+    }
+  }
+}
+
+#[cacheable]
+#[derive(Debug, Default, Clone, Copy, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum BuildMetaExportsType {
   #[default]
+  Unset,
   Default,
   Namespace,
   Flagged,
   Dynamic,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone, Copy, Hash)]
+pub enum ExportsType {
+  DefaultOnly,
+  Namespace,
+  DefaultWithNamed,
+  Dynamic,
+}
+
+#[cacheable]
+#[derive(Debug, Default, Clone, Copy, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum BuildMetaDefaultObject {
   #[default]
   False,
   Redirect,
-  RedirectWarn,
+  RedirectWarn {
+    // Whether to ignore the warning, should use false for most cases
+    // Only ignore the cases that do not follow the standards but are
+    // widely used by the community, making it difficult to migrate.
+    // For example, JSON named exports.
+    ignore: bool,
+  },
 }
 
-#[derive(Debug, Default, Clone)]
+#[cacheable]
+#[derive(Debug, Default, Clone, Copy, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModuleArgument {
+  #[default]
+  Module,
+  WebpackModule,
+}
+
+impl Display for ModuleArgument {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      ModuleArgument::Module => write!(f, "module"),
+      ModuleArgument::WebpackModule => write!(f, "__webpack_module__"),
+    }
+  }
+}
+
+#[cacheable]
+#[derive(Debug, Default, Clone, Copy, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExportsArgument {
+  #[default]
+  Exports,
+  WebpackExports,
+}
+
+impl Display for ExportsArgument {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      ExportsArgument::Exports => write!(f, "exports"),
+      ExportsArgument::WebpackExports => write!(f, "__webpack_exports__"),
+    }
+  }
+}
+
+#[cacheable]
+#[derive(Debug, Default, Clone, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BuildMeta {
-  pub strict: bool,
-  pub strict_harmony_module: bool,
-  pub is_async: bool,
+  pub strict_esm_module: bool,
+  // same as is_async https://github.com/webpack/webpack/blob/3919c844eca394d73ca930e4fc5506fb86e2b094/lib/Module.js#L107
+  pub has_top_level_await: bool,
   pub esm: bool,
   pub exports_type: BuildMetaExportsType,
   pub default_object: BuildMetaDefaultObject,
-  pub module_argument: &'static str,
-  pub exports_argument: &'static str,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub side_effect_free: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub exports_final_name: Option<Vec<(String, String)>>,
 }
 
 // webpack build info
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct BuildResult {
   /// Whether the result is cacheable, i.e shared between builds.
-  pub build_meta: BuildMeta,
-  pub build_info: BuildInfo,
-  pub dependencies: Vec<Box<dyn ModuleDependency>>,
+  pub dependencies: Vec<BoxDependency>,
+  pub blocks: Vec<Box<AsyncDependenciesBlock>>,
+  pub optimization_bailouts: Vec<String>,
 }
 
+#[cacheable]
 #[derive(Debug, Default, Clone)]
 pub struct FactoryMeta {
-  pub side_effects: Option<bool>,
+  pub side_effect_free: Option<bool>,
 }
 
 pub type ModuleIdentifier = Identifier;
 
+#[cacheable_dyn]
 #[async_trait]
-pub trait Module: Debug + Send + Sync + AsAny + DynHash + DynEq + Identifiable {
+pub trait Module:
+  Debug
+  + Send
+  + Sync
+  + Any
+  + AsAny
+  + Identifiable
+  + DependenciesBlock
+  + Diagnosable
+  + ModuleSourceMapConfig
+{
   /// Defines what kind of module this is.
   fn module_type(&self) -> &ModuleType;
 
   /// Defines what kind of code generation results this module can generate.
   fn source_types(&self) -> &[SourceType];
 
-  /// The original source of the module. This could be optional, modules like the `NormalModule` can have the corresponding original source.
-  /// However, modules that is created from "nowhere" (e.g. `ExternalModule` and `MissingModule`) does not have its original source.
-  fn original_source(&self) -> Option<&dyn Source>;
+  /// The source of the module. This could be optional, modules like the `NormalModule` can have the corresponding source.
+  /// However, modules that is created from "nowhere" (e.g. `ExternalModule` and `MissingModule`) does not have its source.
+  fn source(&self) -> Option<&BoxSource>;
 
   /// User readable identifier of the module.
   fn readable_identifier(&self, _context: &Context) -> Cow<str>;
 
   /// The size of the original source, which will used as a parameter for code-splitting.
-  fn size(&self, _source_type: &SourceType) -> f64;
+  /// Only when calculating the size of the RuntimeModule is the Compilation depended on
+  fn size(&self, source_type: Option<&SourceType>, compilation: Option<&Compilation>) -> f64;
 
   /// The actual build of the module, which will be called by the `Compilation`.
   /// Build can also returns the dependencies of the module, which will be used by the `Compilation` to build the dependency graph.
   async fn build(
     &mut self,
-    _build_context: BuildContext<'_>,
-  ) -> Result<TWithDiagnosticArray<BuildResult>> {
-    Ok(BuildResult::default().with_empty_diagnostic())
+    _build_context: BuildContext,
+    _compilation: Option<&Compilation>,
+  ) -> Result<BuildResult> {
+    Ok(Default::default())
+  }
+
+  fn factory_meta(&self) -> Option<&FactoryMeta>;
+
+  fn set_factory_meta(&mut self, factory_meta: FactoryMeta);
+
+  fn build_info(&self) -> &BuildInfo;
+
+  fn build_info_mut(&mut self) -> &mut BuildInfo;
+
+  fn build_meta(&self) -> &BuildMeta;
+
+  fn build_meta_mut(&mut self) -> &mut BuildMeta;
+
+  fn get_exports_argument(&self) -> ExportsArgument {
+    self.build_info().exports_argument
+  }
+
+  fn get_module_argument(&self) -> ModuleArgument {
+    self.build_info().module_argument
+  }
+
+  fn get_exports_type(&self, module_graph: &ModuleGraph, strict: bool) -> ExportsType {
+    get_exports_type_impl(self.identifier(), self.build_meta(), module_graph, strict)
+  }
+
+  fn get_strict_esm_module(&self) -> bool {
+    self.build_meta().strict_esm_module
   }
 
   /// The actual code generation of the module, which will be called by the `Compilation`.
@@ -111,18 +278,29 @@ pub trait Module: Debug + Send + Sync + AsAny + DynHash + DynEq + Identifiable {
   ///
   /// Code generation will often iterate through every `source_types` given by the module
   /// to provide multiple code generation results for different `source_type`s.
-  fn code_generation(&self, _compilation: &Compilation) -> Result<CodeGenerationResult>;
+  fn code_generation(
+    &self,
+    _compilation: &Compilation,
+    _runtime: Option<&RuntimeSpec>,
+    _concatenation_scope: Option<ConcatenationScope>,
+  ) -> Result<CodeGenerationResult>;
 
   /// Name matched against bundle-splitting conditions.
-  fn name_for_condition(&self) -> Option<Cow<str>> {
+  fn name_for_condition(&self) -> Option<Box<str>> {
     // Align with https://github.com/webpack/webpack/blob/8241da7f1e75c5581ba535d127fa66aeb9eb2ac8/lib/Module.js#L852
     None
   }
 
-  /// Apply module hash to the provided hasher.
-  fn update_hash(&self, state: &mut dyn std::hash::Hasher) {
-    self.dyn_hash(state);
-  }
+  /// Update hash for cgm.hash (chunk graph module hash)
+  /// Different cgm code generation result should have different cgm.hash,
+  /// so this also accept compilation (mainly chunk graph) and runtime as args.
+  /// (Difference with `impl Hash for Module`: this is just a part for calculating cgm.hash, not for Module itself)
+  fn update_hash(
+    &self,
+    hasher: &mut dyn std::hash::Hasher,
+    compilation: &Compilation,
+    runtime: Option<&RuntimeSpec>,
+  ) -> Result<()>;
 
   fn lib_ident(&self, _options: LibIdentOptions) -> Option<Cow<str>> {
     // Align with https://github.com/webpack/webpack/blob/4b4ca3bb53f36a5b8fc6bc1bd976ed7af161bd80/lib/Module.js#L845
@@ -137,23 +315,196 @@ pub trait Module: Debug + Send + Sync + AsAny + DynHash + DynEq + Identifiable {
     None
   }
 
-  fn get_presentational_dependencies(&self) -> Option<&[Box<dyn Dependency>]> {
+  fn get_presentational_dependencies(&self) -> Option<&[Box<dyn DependencyTemplate>]> {
     None
+  }
+
+  fn get_concatenation_bailout_reason(
+    &self,
+    _mg: &ModuleGraph,
+    _cg: &ChunkGraph,
+  ) -> Option<Cow<'static, str>> {
+    Some(
+      format!(
+        "Module Concatenation is not implemented for {}",
+        self.module_type()
+      )
+      .into(),
+    )
   }
 
   /// Resolve options matched by module rules.
   /// e.g `javascript/esm` may have special resolving options like `fullySpecified`.
   /// `css` and `css/module` may have special resolving options like `preferRelative`.
-  fn get_resolve_options(&self) -> Option<&Resolve> {
+  fn get_resolve_options(&self) -> Option<Arc<Resolve>> {
     None
   }
+
+  fn get_context(&self) -> Option<Box<Context>> {
+    None
+  }
+
+  fn get_layer(&self) -> Option<&ModuleLayer> {
+    None
+  }
+
+  fn chunk_condition(&self, _chunk_key: &ChunkUkey, _compilation: &Compilation) -> Option<bool> {
+    None
+  }
+
+  fn get_side_effects_connection_state(
+    &self,
+    _module_graph: &ModuleGraph,
+    _module_chain: &mut IdentifierSet,
+  ) -> ConnectionState {
+    ConnectionState::Bool(true)
+  }
+
+  fn need_build(&self) -> bool {
+    !self.build_info().cacheable
+  }
+
+  fn depends_on(&self, modified_file: &HashSet<ArcPath>) -> bool {
+    let build_info = self.build_info();
+    for item in modified_file {
+      if build_info.file_dependencies.contains(item)
+        || build_info.build_dependencies.contains(item)
+        || build_info.context_dependencies.contains(item)
+        || build_info.missing_dependencies.contains(item)
+      {
+        return true;
+      }
+    }
+
+    false
+  }
+
+  fn need_id(&self) -> bool {
+    true
+  }
+}
+
+fn get_exports_type_impl(
+  identifier: ModuleIdentifier,
+  build_meta: &BuildMeta,
+  mg: &ModuleGraph,
+  strict: bool,
+) -> ExportsType {
+  let export_type = &build_meta.exports_type;
+  let default_object = &build_meta.default_object;
+  match export_type {
+    BuildMetaExportsType::Flagged => {
+      if strict {
+        ExportsType::DefaultWithNamed
+      } else {
+        ExportsType::Namespace
+      }
+    }
+    BuildMetaExportsType::Namespace => ExportsType::Namespace,
+    BuildMetaExportsType::Default => match default_object {
+      BuildMetaDefaultObject::Redirect => ExportsType::DefaultWithNamed,
+      BuildMetaDefaultObject::RedirectWarn { .. } => {
+        if strict {
+          ExportsType::DefaultOnly
+        } else {
+          ExportsType::DefaultWithNamed
+        }
+      }
+      BuildMetaDefaultObject::False => ExportsType::DefaultOnly,
+    },
+    BuildMetaExportsType::Dynamic => {
+      if strict {
+        ExportsType::DefaultWithNamed
+      } else {
+        fn handle_default(default_object: &BuildMetaDefaultObject) -> ExportsType {
+          match default_object {
+            BuildMetaDefaultObject::Redirect => ExportsType::DefaultWithNamed,
+            BuildMetaDefaultObject::RedirectWarn { .. } => ExportsType::DefaultWithNamed,
+            _ => ExportsType::DefaultOnly,
+          }
+        }
+
+        if let Some(export_info) =
+          mg.get_read_only_export_info(&identifier, Atom::from("__esModule"))
+        {
+          if matches!(export_info.provided(mg), Some(ExportInfoProvided::False)) {
+            handle_default(default_object)
+          } else {
+            let Some(target) = export_info.get_target(mg) else {
+              return ExportsType::Dynamic;
+            };
+            if target
+              .export
+              .and_then(|t| {
+                if t.len() == 1 {
+                  t.first().cloned()
+                } else {
+                  None
+                }
+              })
+              .is_some_and(|v| v == "__esModule")
+            {
+              let Some(target_exports_type) = mg
+                .module_by_identifier(&target.module)
+                .map(|m| m.build_meta().exports_type)
+              else {
+                return ExportsType::Dynamic;
+              };
+              match target_exports_type {
+                BuildMetaExportsType::Flagged => ExportsType::Namespace,
+                BuildMetaExportsType::Namespace => ExportsType::Namespace,
+                BuildMetaExportsType::Default => handle_default(default_object),
+                _ => ExportsType::Dynamic,
+              }
+            } else {
+              ExportsType::Dynamic
+            }
+          }
+        } else {
+          ExportsType::DefaultWithNamed
+        }
+      }
+    }
+    // align to undefined
+    BuildMetaExportsType::Unset => {
+      if strict {
+        ExportsType::DefaultWithNamed
+      } else {
+        ExportsType::Dynamic
+      }
+    }
+  }
+}
+
+pub fn module_update_hash(
+  module: &dyn Module,
+  hasher: &mut dyn std::hash::Hasher,
+  compilation: &Compilation,
+  runtime: Option<&RuntimeSpec>,
+) {
+  let chunk_graph = &compilation.chunk_graph;
+  chunk_graph
+    .get_module_graph_hash(module, compilation, runtime)
+    .dyn_hash(hasher);
+  if let Some(deps) = module.get_presentational_dependencies() {
+    for dep in deps {
+      dep.update_hash(hasher, compilation, runtime);
+    }
+  }
+  dependencies_block_update_hash(
+    module.get_dependencies(),
+    module.get_blocks(),
+    hasher,
+    compilation,
+    runtime,
+  );
 }
 
 pub trait ModuleExt {
   fn boxed(self) -> Box<dyn Module>;
 }
 
-impl<T: Module + 'static> ModuleExt for T {
+impl<T: Module> ModuleExt for T {
   fn boxed(self) -> Box<dyn Module> {
     Box::new(self)
   }
@@ -169,21 +520,7 @@ impl Identifiable for Box<dyn Module> {
   }
 }
 
-impl PartialEq for dyn Module + '_ {
-  fn eq(&self, other: &Self) -> bool {
-    self.dyn_eq(other.as_any())
-  }
-}
-
-impl Eq for dyn Module + '_ {}
-
-impl Hash for dyn Module + '_ {
-  fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-    self.dyn_hash(state)
-  }
-}
-
-impl dyn Module + '_ {
+impl dyn Module {
   pub fn downcast_ref<T: Module + Any>(&self) -> Option<&T> {
     self.as_any().downcast_ref::<T>()
   }
@@ -193,11 +530,40 @@ impl dyn Module + '_ {
   }
 }
 
+#[macro_export]
+macro_rules! impl_module_meta_info {
+  () => {
+    fn factory_meta(&self) -> Option<&$crate::FactoryMeta> {
+      self.factory_meta.as_ref()
+    }
+
+    fn set_factory_meta(&mut self, v: $crate::FactoryMeta) {
+      self.factory_meta = Some(v);
+    }
+
+    fn build_info(&self) -> &$crate::BuildInfo {
+      &self.build_info
+    }
+
+    fn build_info_mut(&mut self) -> &mut $crate::BuildInfo {
+      &mut self.build_info
+    }
+
+    fn build_meta(&self) -> &$crate::BuildMeta {
+      &self.build_meta
+    }
+
+    fn build_meta_mut(&mut self) -> &mut $crate::BuildMeta {
+      &mut self.build_meta
+    }
+  };
+}
+
 macro_rules! impl_module_downcast_helpers {
   ($ty:ty, $ident:ident) => {
-    impl dyn Module + '_ {
+    impl dyn Module {
       ::paste::paste! {
-        pub fn [<as_ $ident>](&self) -> Option<& $ty> {
+        pub fn [<as_ $ident>](&self) -> Option<&$ty> {
           self.as_any().downcast_ref::<$ty>()
         }
 
@@ -205,9 +571,9 @@ macro_rules! impl_module_downcast_helpers {
           self.as_any_mut().downcast_mut::<$ty>()
         }
 
-        pub fn [<try_as_ $ident>](&self) -> Result<& $ty> {
+        pub fn [<try_as_ $ident>](&self) -> Result<&$ty> {
           self.[<as_ $ident>]().ok_or_else(|| {
-            ::rspack_error::internal_error!(
+            ::rspack_error::error!(
               "Failed to cast module to a {}",
               stringify!($ty)
             )
@@ -216,7 +582,7 @@ macro_rules! impl_module_downcast_helpers {
 
         pub fn [<try_as_ $ident _mut>](&mut self) -> Result<&mut $ty> {
           self.[<as_ $ident _mut>]().ok_or_else(|| {
-            ::rspack_error::internal_error!(
+            ::rspack_error::error!(
               "Failed to cast module to a {}",
               stringify!($ty)
             )
@@ -231,60 +597,71 @@ impl_module_downcast_helpers!(NormalModule, normal_module);
 impl_module_downcast_helpers!(RawModule, raw_module);
 impl_module_downcast_helpers!(ContextModule, context_module);
 impl_module_downcast_helpers!(ExternalModule, external_module);
+impl_module_downcast_helpers!(SelfModule, self_module);
+impl_module_downcast_helpers!(ConcatenatedModule, concatenated_module);
+
+pub struct LibIdentOptions<'me> {
+  pub context: &'me str,
+}
 
 #[cfg(test)]
 mod test {
   use std::borrow::Cow;
-  use std::hash::{Hash, Hasher};
 
-  use rspack_error::{Result, TWithDiagnosticArray};
-  use rspack_identifier::{Identifiable, Identifier};
-  use rspack_sources::Source;
+  use rspack_cacheable::cacheable;
+  use rspack_collections::{Identifiable, Identifier};
+  use rspack_error::{impl_empty_diagnosable_trait, Result};
+  use rspack_sources::BoxSource;
+  use rspack_util::source_map::{ModuleSourceMapConfig, SourceMapKind};
 
   use super::Module;
   use crate::{
-    BuildContext, BuildResult, CodeGenerationResult, Compilation, Context, ModuleExt, ModuleType,
-    SourceType,
+    AsyncDependenciesBlockIdentifier, BuildContext, BuildResult, CodeGenerationResult, Compilation,
+    ConcatenationScope, Context, DependenciesBlock, DependencyId, ModuleExt, ModuleType,
+    RuntimeSpec, SourceType,
   };
 
-  #[derive(Debug, Eq)]
-  struct RawModule(&'static str);
+  #[cacheable]
+  #[derive(Debug)]
+  struct RawModule(String);
 
-  impl PartialEq for RawModule {
-    fn eq(&self, other: &Self) -> bool {
-      self.identifier() == other.identifier()
-    }
-  }
-
-  #[derive(Debug, Eq)]
-  struct ExternalModule(&'static str);
-
-  impl PartialEq for ExternalModule {
-    fn eq(&self, other: &Self) -> bool {
-      self.identifier() == other.identifier()
-    }
-  }
-
-  impl Hash for RawModule {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-      self.identifier().hash(state);
-    }
-  }
-
-  impl Hash for ExternalModule {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-      self.identifier().hash(state);
-    }
-  }
+  #[cacheable]
+  #[derive(Debug)]
+  struct ExternalModule(String);
 
   macro_rules! impl_noop_trait_module_type {
     ($ident: ident) => {
       impl Identifiable for $ident {
         fn identifier(&self) -> Identifier {
-          (stringify!($ident).to_owned() + self.0).into()
+          self.0.clone().into()
         }
       }
 
+      impl_empty_diagnosable_trait!($ident);
+
+      impl DependenciesBlock for $ident {
+        fn add_block_id(&mut self, _: AsyncDependenciesBlockIdentifier) {
+          unreachable!()
+        }
+
+        fn get_blocks(&self) -> &[AsyncDependenciesBlockIdentifier] {
+          unreachable!()
+        }
+
+        fn add_dependency_id(&mut self, _: DependencyId) {
+          unreachable!()
+        }
+
+        fn remove_dependency_id(&mut self, _: DependencyId) {
+          unreachable!()
+        }
+
+        fn get_dependencies(&self) -> &[DependencyId] {
+          unreachable!()
+        }
+      }
+
+      #[::rspack_cacheable::cacheable_dyn]
       #[::async_trait::async_trait]
       impl Module for $ident {
         fn module_type(&self) -> &ModuleType {
@@ -295,26 +672,78 @@ mod test {
           unreachable!()
         }
 
-        fn original_source(&self) -> Option<&dyn Source> {
+        fn source(&self) -> Option<&BoxSource> {
           unreachable!()
         }
 
-        fn size(&self, _source_type: &SourceType) -> f64 {
+        fn size(
+          &self,
+          _source_type: Option<&SourceType>,
+          _compilation: Option<&Compilation>,
+        ) -> f64 {
           unreachable!()
         }
 
         fn readable_identifier(&self, _context: &Context) -> Cow<str> {
-          (stringify!($ident).to_owned() + self.0).into()
+          self.0.clone().into()
         }
 
         async fn build(
           &mut self,
-          _build_context: BuildContext<'_>,
-        ) -> Result<TWithDiagnosticArray<BuildResult>> {
+          _build_context: BuildContext,
+          _compilation: Option<&Compilation>,
+        ) -> Result<BuildResult> {
           unreachable!()
         }
 
-        fn code_generation(&self, _compilation: &Compilation) -> Result<CodeGenerationResult> {
+        fn update_hash(
+          &self,
+          _hasher: &mut dyn std::hash::Hasher,
+          _compilation: &Compilation,
+          _runtime: Option<&RuntimeSpec>,
+        ) -> Result<()> {
+          unreachable!()
+        }
+
+        fn code_generation(
+          &self,
+          _compilation: &Compilation,
+          _runtime: Option<&RuntimeSpec>,
+          _concatenation_scope: Option<ConcatenationScope>,
+        ) -> Result<CodeGenerationResult> {
+          unreachable!()
+        }
+
+        fn factory_meta(&self) -> Option<&crate::FactoryMeta> {
+          unreachable!()
+        }
+
+        fn build_info(&self) -> &crate::BuildInfo {
+          unreachable!()
+        }
+
+        fn build_info_mut(&mut self) -> &mut crate::BuildInfo {
+          unreachable!()
+        }
+
+        fn build_meta(&self) -> &crate::BuildMeta {
+          unreachable!()
+        }
+
+        fn build_meta_mut(&mut self) -> &mut crate::BuildMeta {
+          unreachable!()
+        }
+
+        fn set_factory_meta(&mut self, _: crate::FactoryMeta) {
+          unreachable!()
+        }
+      }
+
+      impl ModuleSourceMapConfig for $ident {
+        fn get_source_map_kind(&self) -> &SourceMapKind {
+          unreachable!()
+        }
+        fn set_source_map_kind(&mut self, _source_map: SourceMapKind) {
           unreachable!()
         }
       }
@@ -326,8 +755,8 @@ mod test {
 
   #[test]
   fn should_downcast_successfully() {
-    let a: Box<dyn Module> = ExternalModule("a").boxed();
-    let b: Box<dyn Module> = RawModule("a").boxed();
+    let a: Box<dyn Module> = ExternalModule(String::from("a")).boxed();
+    let b: Box<dyn Module> = RawModule(String::from("a")).boxed();
 
     assert!(a.downcast_ref::<ExternalModule>().is_some());
     assert!(b.downcast_ref::<RawModule>().is_some());
@@ -337,44 +766,4 @@ mod test {
     assert!(a.downcast_ref::<ExternalModule>().is_some());
     assert!(b.downcast_ref::<RawModule>().is_some());
   }
-
-  #[test]
-  fn hash_should_work() {
-    let e1: Box<dyn Module> = ExternalModule("e").boxed();
-    let e2: Box<dyn Module> = ExternalModule("e").boxed();
-
-    let mut state1 = xxhash_rust::xxh3::Xxh3::default();
-    let mut state2 = xxhash_rust::xxh3::Xxh3::default();
-    e1.hash(&mut state1);
-    e2.hash(&mut state2);
-
-    let hash1 = format!("{:016x}", state1.finish());
-    let hash2 = format!("{:016x}", state2.finish());
-    assert_eq!(hash1, hash2);
-
-    let e3: Box<dyn Module> = ExternalModule("e3").boxed();
-    let mut state3 = xxhash_rust::xxh3::Xxh3::default();
-    e3.hash(&mut state3);
-
-    let hash3 = format!("{:016x}", state3.finish());
-    assert_ne!(hash1, hash3);
-  }
-
-  #[test]
-  fn eq_should_work() {
-    let e1 = ExternalModule("e");
-    let e2 = ExternalModule("e");
-
-    assert_eq!(e1, e2);
-    assert_eq!(&e1.boxed(), &e2.boxed());
-
-    let r1 = RawModule("r1");
-    let r2 = RawModule("r2");
-    assert_ne!(r1, r2);
-    assert_ne!(&r1.boxed(), &r2.boxed());
-  }
-}
-
-pub struct LibIdentOptions<'me> {
-  pub context: &'me str,
 }

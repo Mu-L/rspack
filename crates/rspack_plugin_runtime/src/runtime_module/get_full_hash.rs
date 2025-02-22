@@ -1,21 +1,20 @@
+use cow_utils::CowUtils;
+use rspack_collections::Identifier;
 use rspack_core::{
-  rspack_sources::{BoxSource, RawSource, SourceExt},
+  impl_runtime_module,
+  rspack_sources::{BoxSource, RawStringSource, SourceExt},
   Compilation, RuntimeModule,
 };
-use rspack_identifier::Identifier;
 
-use crate::impl_runtime_module;
-
-#[derive(Debug, Eq)]
+#[impl_runtime_module]
+#[derive(Debug)]
 pub struct GetFullHashRuntimeModule {
   id: Identifier,
 }
 
 impl Default for GetFullHashRuntimeModule {
   fn default() -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/get_full_hash"),
-    }
+    Self::with_default(Identifier::from("webpack/runtime/get_full_hash"))
   }
 }
 
@@ -24,16 +23,18 @@ impl RuntimeModule for GetFullHashRuntimeModule {
     self.id
   }
 
-  fn generate(&self, compilation: &Compilation) -> BoxSource {
-    RawSource::from(
-      include_str!("runtime/get_full_hash.js").replace("$HASH$", compilation.hash.as_str()),
+  fn generate(&self, compilation: &Compilation) -> rspack_error::Result<BoxSource> {
+    Ok(
+      RawStringSource::from(
+        include_str!("runtime/get_full_hash.js")
+          .cow_replace("$HASH$", compilation.get_hash().unwrap_or("XXXX"))
+          .into_owned(),
+      )
+      .boxed(),
     )
-    .boxed()
   }
 
-  fn cacheable(&self) -> bool {
-    false
+  fn full_hash(&self) -> bool {
+    true
   }
 }
-
-impl_runtime_module!(GetFullHashRuntimeModule);

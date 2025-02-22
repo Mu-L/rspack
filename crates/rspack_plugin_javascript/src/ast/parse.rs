@@ -1,35 +1,35 @@
-use std::path::Path;
 use std::sync::Arc;
 
-use rspack_core::{ast::javascript::Ast, ModuleType};
-use rspack_error::Error;
+use rspack_ast::javascript::Ast;
+use rspack_core::ModuleType;
+use rspack_error::TraceableError;
 use swc_core::common::comments::Comments;
-use swc_core::common::{FileName, SourceFile};
-use swc_core::ecma::ast::{self, EsVersion, Program};
-use swc_core::ecma::parser::{
-  self, parse_file_as_module, parse_file_as_program, parse_file_as_script, Syntax,
-};
+use swc_core::common::input::SourceFileInput;
+use swc_core::common::{SourceFile, SourceMap};
+use swc_core::ecma::ast::{EsVersion, Program};
+use swc_core::ecma::parser::lexer::Lexer;
+use swc_core::ecma::parser::{self, Parser, Syntax};
 use swc_node_comments::SwcComments;
 
-use crate::utils::{ecma_parse_error_to_rspack_error, syntax_by_module_type};
+use crate::utils::{ecma_parse_error_deduped_to_rspack_error, DedupEcmaErrors};
 use crate::IsModule;
 
 fn module_type_to_is_module(value: &ModuleType) -> IsModule {
   // parser options align with webpack
   match value {
-    ModuleType::JsEsm | ModuleType::JsxEsm => IsModule::Bool(true),
-    ModuleType::JsDynamic | ModuleType::JsxDynamic => IsModule::Bool(false),
+    ModuleType::JsEsm => IsModule::Bool(true),
+    ModuleType::JsDynamic => IsModule::Bool(false),
     _ => IsModule::Unknown,
   }
 }
 
 /// Why this helper function design like this?
 /// 1. `swc_ecma_parser` could return ast with some errors which are recoverable
-/// or warning (though swc defined them as errors), but the parser at here should
-/// be non-error-tolerant.
+///    or warning (though swc defined them as errors), but the parser at here should
+///    be non-error-tolerant.
 ///
 /// 2. We can't convert to [rspack_error::Error] at this point, because there is
-/// no `path` and `source`
+///    no `path` and `source`
 pub fn parse_js(
   fm: Arc<SourceFile>,
   target: EsVersion,
@@ -37,85 +37,65 @@ pub fn parse_js(
   is_module: IsModule,
   comments: Option<&dyn Comments>,
 ) -> Result<Program, Vec<parser::error::Error>> {
-  let mut errors = vec![];
-  let program_result = match is_module {
-    IsModule::Bool(true) => {
-      parse_file_as_module(&fm, syntax, target, comments, &mut errors).map(Program::Module)
+  let lexer = Lexer::new(syntax, target, SourceFileInput::from(&*fm), comments);
+  parse_with_lexer(lexer, is_module)
+}
+
+fn parse_with_lexer(
+  lexer: Lexer,
+  is_module: IsModule,
+) -> Result<Program, Vec<parser::error::Error>> {
+  let inner = || {
+    let mut parser = Parser::new_from(lexer);
+    let program_result = match is_module {
+      IsModule::Bool(true) => parser.parse_module().map(Program::Module),
+      IsModule::Bool(false) => parser.parse_script().map(Program::Script),
+      IsModule::Unknown => parser.parse_program(),
+    };
+    let mut errors = parser.take_errors();
+    // Using combinator will let rustc unhappy.
+    match program_result {
+      Ok(program) => {
+        if !errors.is_empty() {
+          return Err(errors);
+        }
+        Ok(program)
+      }
+      Err(err) => {
+        errors.push(err);
+        Err(errors)
+      }
     }
-    IsModule::Bool(false) => {
-      parse_file_as_script(&fm, syntax, target, comments, &mut errors).map(Program::Script)
-    }
-    IsModule::Unknown => parse_file_as_program(&fm, syntax, target, comments, &mut errors),
   };
 
-  // Using combinator will let rustc unhappy.
-  match program_result {
-    Ok(program) => {
-      if !errors.is_empty() {
-        return Err(errors);
-      }
-      Ok(program)
-    }
-    Err(err) => {
-      errors.push(err);
-      Err(errors)
-    }
+  #[cfg(debug_assertions)]
+  {
+    // Adjust stack to avoid stack overflow.
+    stacker::maybe_grow(
+      2 * 1024 * 1024, /* 2mb */
+      4 * 1024 * 1024, /* 4mb */
+      inner,
+    )
   }
+  #[cfg(not(debug_assertions))]
+  inner()
 }
 
 pub fn parse(
-  source_code: String,
-  syntax: Syntax,
-  filename: &str,
+  lexer: Lexer,
+  fm: &SourceFile,
+  cm: Arc<SourceMap>,
+  comments: Option<SwcComments>,
   module_type: &ModuleType,
-) -> Result<Ast, Error> {
-  let source_code = if syntax.dts() {
-    // dts build result must be empty
-    "".to_string()
-  } else {
-    source_code
-  };
-
-  let cm: Arc<swc_core::common::SourceMap> = Default::default();
-  let fm = cm.new_source_file(FileName::Custom(filename.to_string()), source_code);
-  let comments = SwcComments::default();
-
-  match parse_js(
-    fm.clone(),
-    ast::EsVersion::Es2022,
-    syntax,
-    module_type_to_is_module(module_type),
-    Some(&comments),
-  ) {
-    Ok(program) => Ok(Ast::new(program, cm, Some(comments))),
-    Err(errs) => Err(Error::BatchErrors(
+) -> Result<Ast, Vec<TraceableError>> {
+  match parse_with_lexer(lexer, module_type_to_is_module(module_type)) {
+    Ok(program) => Ok(Ast::new(program, cm, comments)),
+    Err(errs) => Err(
       errs
+        .dedup_ecma_errors()
         .into_iter()
-        .map(|err| ecma_parse_error_to_rspack_error(err, &fm, module_type))
+        .map(|err| ecma_parse_error_deduped_to_rspack_error(err, fm, module_type))
         .collect::<Vec<_>>(),
-    )),
-  }
-}
-
-pub fn parse_js_code(js_code: String, module_type: &ModuleType) -> Result<Program, Error> {
-  let filename = "".to_string();
-  let syntax = syntax_by_module_type(Path::new(&filename), module_type, false);
-  let cm: Arc<swc_core::common::SourceMap> = Default::default();
-  let fm = cm.new_source_file(FileName::Custom(filename), js_code);
-
-  match parse_js(
-    fm.clone(),
-    ast::EsVersion::Es2022,
-    syntax,
-    module_type_to_is_module(module_type),
-    None,
-  ) {
-    Ok(program) => Ok(program),
-    Err(errs) => Err(Error::BatchErrors(
-      errs
-        .into_iter()
-        .map(|err| ecma_parse_error_to_rspack_error(err, &fm, module_type))
-        .collect::<Vec<_>>(),
-    )),
+    ),
   }
 }

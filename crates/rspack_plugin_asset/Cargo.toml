@@ -1,25 +1,26 @@
 [package]
-edition    = "2021"
-license    = "MIT"
-name       = "rspack_plugin_asset"
-repository = "https://github.com/web-infra-dev/rspack"
-version    = "0.1.0"
-
+description = "rspack asset plugin"
+edition     = "2021"
+license     = "MIT"
+name        = "rspack_plugin_asset"
+repository  = "https://github.com/web-infra-dev/rspack"
+version     = "0.2.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[dev-dependencies]
-rspack_testing = { path = "../rspack_testing" }
-
 [dependencies]
-anyhow        = { workspace = true }
-async-trait   = { workspace = true }
-mime_guess    = { workspace = true }
-once_cell     = { workspace = true }
-rayon         = { workspace = true }
-regex         = { workspace = true }
-rspack_base64 = { path = "../rspack_base64" }
-rspack_core   = { path = "../rspack_core" }
-rspack_error  = { path = "../rspack_error" }
-rspack_util   = { path = "../rspack_util" }
-serde_json    = { workspace = true }
-urlencoding   = { workspace = true }
+async-trait      = { workspace = true }
+mime_guess       = { workspace = true }
+rayon            = { workspace = true }
+rspack_base64    = { workspace = true }
+rspack_cacheable = { workspace = true }
+rspack_core      = { workspace = true }
+rspack_error     = { workspace = true }
+rspack_hash      = { workspace = true }
+rspack_hook      = { workspace = true }
+rspack_util      = { workspace = true }
+serde_json       = { workspace = true }
+tracing          = { workspace = true }
+urlencoding      = { workspace = true }
+
+[package.metadata.cargo-shear]
+ignored = ["tracing"]

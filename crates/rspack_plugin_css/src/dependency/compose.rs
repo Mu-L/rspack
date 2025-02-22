@@ -1,31 +1,41 @@
-use rspack_core::{
-  CodeGeneratable, CodeGeneratableContext, CodeGeneratableResult, Dependency, DependencyCategory,
-  DependencyId, DependencyType, ErrorSpan, ModuleDependency,
+use rspack_cacheable::{
+  cacheable, cacheable_dyn,
+  with::{AsPreset, AsVec},
 };
+use rspack_core::{
+  AsContextDependency, AsDependencyTemplate, Dependency, DependencyCategory, DependencyId,
+  DependencyRange, DependencyType, ExtendedReferencedExport, FactorizeInfo, ModuleDependency,
+  RuntimeSpec,
+};
+use rspack_util::atom::Atom;
 
+#[cacheable]
 #[derive(Debug, Clone)]
 pub struct CssComposeDependency {
-  id: Option<DependencyId>,
+  id: DependencyId,
   request: String,
-  span: Option<ErrorSpan>,
+  #[cacheable(with=AsVec<AsPreset>)]
+  names: Vec<Atom>,
+  range: DependencyRange,
+  factorize_info: FactorizeInfo,
 }
 
 impl CssComposeDependency {
-  pub fn new(request: String, span: Option<ErrorSpan>) -> Self {
+  pub fn new(request: String, names: Vec<Atom>, range: DependencyRange) -> Self {
     Self {
-      id: None,
+      id: DependencyId::new(),
       request,
-      span,
+      names,
+      range,
+      factorize_info: Default::default(),
     }
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for CssComposeDependency {
-  fn id(&self) -> Option<DependencyId> {
-    self.id
-  }
-  fn set_id(&mut self, id: Option<DependencyId>) {
-    self.id = id;
+  fn id(&self) -> &DependencyId {
+    &self.id
   }
 
   fn category(&self) -> &DependencyCategory {
@@ -35,8 +45,29 @@ impl Dependency for CssComposeDependency {
   fn dependency_type(&self) -> &DependencyType {
     &DependencyType::CssCompose
   }
+
+  fn range(&self) -> Option<&DependencyRange> {
+    Some(&self.range)
+  }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::True
+  }
+
+  fn get_referenced_exports(
+    &self,
+    _module_graph: &rspack_core::ModuleGraph,
+    _runtime: Option<&RuntimeSpec>,
+  ) -> Vec<ExtendedReferencedExport> {
+    self
+      .names
+      .iter()
+      .map(|n| ExtendedReferencedExport::Array(vec![n.clone()]))
+      .collect()
+  }
 }
 
+#[cacheable_dyn]
 impl ModuleDependency for CssComposeDependency {
   fn request(&self) -> &str {
     &self.request
@@ -46,16 +77,18 @@ impl ModuleDependency for CssComposeDependency {
     &self.request
   }
 
-  fn span(&self) -> Option<&ErrorSpan> {
-    self.span.as_ref()
+  fn set_request(&mut self, request: String) {
+    self.request = request;
+  }
+
+  fn factorize_info(&self) -> &FactorizeInfo {
+    &self.factorize_info
+  }
+
+  fn factorize_info_mut(&mut self) -> &mut FactorizeInfo {
+    &mut self.factorize_info
   }
 }
 
-impl CodeGeneratable for CssComposeDependency {
-  fn generate(
-    &self,
-    _code_generatable_context: &mut CodeGeneratableContext,
-  ) -> rspack_error::Result<CodeGeneratableResult> {
-    Ok(CodeGeneratableResult::default())
-  }
-}
+impl AsDependencyTemplate for CssComposeDependency {}
+impl AsContextDependency for CssComposeDependency {}

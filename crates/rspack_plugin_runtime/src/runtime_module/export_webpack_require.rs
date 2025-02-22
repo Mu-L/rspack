@@ -1,21 +1,19 @@
+use rspack_collections::Identifier;
 use rspack_core::{
-  rspack_sources::{BoxSource, RawSource, SourceExt},
+  impl_runtime_module,
+  rspack_sources::{BoxSource, RawStringSource, SourceExt},
   Compilation, RuntimeModule,
 };
-use rspack_identifier::Identifier;
 
-use crate::impl_runtime_module;
-
-#[derive(Debug, Default, Eq)]
+#[impl_runtime_module]
+#[derive(Debug, Default)]
 pub struct ExportWebpackRequireRuntimeModule {
   id: Identifier,
 }
 
 impl ExportWebpackRequireRuntimeModule {
   pub fn new() -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/export_webpack_runtime"),
-    }
+    Self::with_default(Identifier::from("webpack/runtime/export_webpack_runtime"))
   }
 }
 
@@ -24,13 +22,11 @@ impl RuntimeModule for ExportWebpackRequireRuntimeModule {
     self.id
   }
 
-  fn generate(&self, _compilation: &Compilation) -> BoxSource {
-    RawSource::from("export default __webpack_require__;").boxed()
+  fn generate(&self, _compilation: &Compilation) -> rspack_error::Result<BoxSource> {
+    Ok(RawStringSource::from_static("export default __webpack_require__;").boxed())
   }
 
   fn should_isolate(&self) -> bool {
-    true
+    false
   }
 }
-
-impl_runtime_module!(ExportWebpackRequireRuntimeModule);

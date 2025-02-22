@@ -1,12 +1,12 @@
+use rspack_collections::Identifier;
 use rspack_core::{
-  rspack_sources::{BoxSource, RawSource, SourceExt},
+  impl_runtime_module,
+  rspack_sources::{BoxSource, RawStringSource, SourceExt},
   Compilation, RuntimeModule,
 };
-use rspack_identifier::Identifier;
 
-use crate::impl_runtime_module;
-
-#[derive(Debug, Eq)]
+#[impl_runtime_module]
+#[derive(Debug)]
 pub struct StartupEntrypointRuntimeModule {
   id: Identifier,
   async_chunk_loading: bool,
@@ -14,10 +14,10 @@ pub struct StartupEntrypointRuntimeModule {
 
 impl StartupEntrypointRuntimeModule {
   pub fn new(async_chunk_loading: bool) -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/start_entry_point"),
+    Self::with_default(
+      Identifier::from("webpack/runtime/startup_entrypoint"),
       async_chunk_loading,
-    }
+    )
   }
 }
 
@@ -26,14 +26,12 @@ impl RuntimeModule for StartupEntrypointRuntimeModule {
     self.id
   }
 
-  fn generate(&self, _compilation: &Compilation) -> BoxSource {
+  fn generate(&self, _compilation: &Compilation) -> rspack_error::Result<BoxSource> {
     let source = if self.async_chunk_loading {
-      include_str!("runtime/start_entry_point_with_async.js")
+      include_str!("runtime/startup_entrypoint_with_async.js")
     } else {
-      include_str!("runtime/start_entry_point.js")
+      include_str!("runtime/startup_entrypoint.js")
     };
-    RawSource::from(source).boxed()
+    Ok(RawStringSource::from(source).boxed())
   }
 }
-
-impl_runtime_module!(StartupEntrypointRuntimeModule);

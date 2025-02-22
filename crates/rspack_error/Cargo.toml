@@ -1,27 +1,26 @@
 [package]
-edition    = "2021"
-license    = "MIT"
-name       = "rspack_error"
-repository = "https://github.com/web-infra-dev/rspack"
-version    = "0.1.0"
-
+description = "rspack error"
+edition     = "2021"
+license     = "MIT"
+name        = "rspack_error"
+repository  = "https://github.com/web-infra-dev/rspack"
+version     = "0.2.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 anyhow             = { workspace = true, features = ["backtrace"] }
-codespan-reporting = "0.11.1"
+cow-utils          = { workspace = true }
+derive_more        = { workspace = true, features = ["debug"] }
 futures            = { workspace = true }
-rspack_util        = { path = "../rspack_util" }
-sugar_path         = { workspace = true }
-swc_core           = { workspace = true, features = ["common"] }
-termcolor          = "1.2"
+miette             = { version = "7.2.0", features = ["fancy"] }
+once_cell          = { workspace = true }
+owo-colors         = "4.0.0"
+rspack_cacheable   = { workspace = true }
+rspack_collections = { workspace = true }
+rspack_paths       = { workspace = true }
+swc_core           = { workspace = true, features = ["common", "common_concurrent"] }
+termcolor          = "1.4.1"
+textwrap           = "0.16.1"
+thiserror          = "1.0.69"
 
-[dev-dependencies]
-insta = { workspace = true }
-# rspack = { path = "../rspack" }
-rspack_binding_options = { path = "../rspack_binding_options" }
-rspack_core            = { path = "../rspack_core" }
-rspack_fs              = { path = "../rspack_fs", features = ["async"] }
-rspack_testing         = { path = "../rspack_testing" }
-rspack_tracing         = { path = "../rspack_tracing" }
-tokio                  = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util", "parking_lot"] }
+unicode-width = "0.2.0"

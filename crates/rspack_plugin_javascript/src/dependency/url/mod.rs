@@ -1,38 +1,48 @@
+use rspack_cacheable::{cacheable, cacheable_dyn, with::AsPreset};
 use rspack_core::{
-  create_javascript_visitor, CodeGeneratable, CodeGeneratableContext, CodeGeneratableResult,
-  Dependency, DependencyCategory, DependencyId, DependencyType, ErrorSpan, JsAstPath,
-  ModuleDependency, RuntimeGlobals,
+  get_dependency_used_by_exports_condition, module_id, AsContextDependency, Compilation,
+  Dependency, DependencyCategory, DependencyCondition, DependencyId, DependencyRange,
+  DependencyTemplate, DependencyType, FactorizeInfo, ModuleDependency, RuntimeGlobals, RuntimeSpec,
+  TemplateContext, TemplateReplaceSource, UsedByExports,
 };
-use swc_core::common::Spanned;
-use swc_core::ecma::utils::{member_expr, quote_ident, quote_str};
-use swc_core::ecma::{ast::*, atoms::JsWord};
+use swc_core::ecma::atoms::Atom;
 
+#[cacheable]
 #[derive(Debug, Clone)]
 pub struct URLDependency {
-  id: Option<DependencyId>,
-  request: JsWord,
-  span: Option<ErrorSpan>,
-  #[allow(unused)]
-  ast_path: JsAstPath,
+  id: DependencyId,
+  #[cacheable(with=AsPreset)]
+  request: Atom,
+  range: DependencyRange,
+  range_url: DependencyRange,
+  used_by_exports: Option<UsedByExports>,
+  relative: bool,
+  factorize_info: FactorizeInfo,
 }
 
 impl URLDependency {
-  pub fn new(request: JsWord, span: Option<ErrorSpan>, ast_path: JsAstPath) -> Self {
+  pub fn new(
+    request: Atom,
+    range: DependencyRange,
+    range_url: DependencyRange,
+    relative: bool,
+  ) -> Self {
     Self {
-      id: None,
+      id: DependencyId::new(),
       request,
-      span,
-      ast_path,
+      range,
+      range_url,
+      used_by_exports: None,
+      relative,
+      factorize_info: Default::default(),
     }
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for URLDependency {
-  fn id(&self) -> Option<DependencyId> {
-    self.id
-  }
-  fn set_id(&mut self, id: Option<DependencyId>) {
-    self.id = id;
+  fn id(&self) -> &DependencyId {
+    &self.id
   }
 
   fn category(&self) -> &DependencyCategory {
@@ -42,8 +52,17 @@ impl Dependency for URLDependency {
   fn dependency_type(&self) -> &DependencyType {
     &DependencyType::NewUrl
   }
+
+  fn range(&self) -> Option<&DependencyRange> {
+    Some(&self.range)
+  }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::True
+  }
 }
 
+#[cacheable_dyn]
 impl ModuleDependency for URLDependency {
   fn request(&self) -> &str {
     &self.request
@@ -53,61 +72,80 @@ impl ModuleDependency for URLDependency {
     &self.request
   }
 
-  fn span(&self) -> Option<&ErrorSpan> {
-    self.span.as_ref()
+  fn set_request(&mut self, request: String) {
+    self.request = request.into();
+  }
+
+  fn get_condition(&self) -> Option<DependencyCondition> {
+    get_dependency_used_by_exports_condition(self.id, self.used_by_exports.as_ref())
+  }
+
+  fn factorize_info(&self) -> &FactorizeInfo {
+    &self.factorize_info
+  }
+
+  fn factorize_info_mut(&mut self) -> &mut FactorizeInfo {
+    &mut self.factorize_info
   }
 }
 
-impl CodeGeneratable for URLDependency {
-  fn generate(
+#[cacheable_dyn]
+impl DependencyTemplate for URLDependency {
+  fn apply(
     &self,
-    code_generatable_context: &mut CodeGeneratableContext,
-  ) -> rspack_error::Result<CodeGeneratableResult> {
-    let CodeGeneratableContext { compilation, .. } = code_generatable_context;
-    let mut code_gen = CodeGeneratableResult::default();
+    source: &mut TemplateReplaceSource,
+    code_generatable_context: &mut TemplateContext,
+  ) {
+    let TemplateContext {
+      compilation,
+      runtime_requirements,
+      ..
+    } = code_generatable_context;
 
-    if let Some(id) = self.id() {
-      if let Some(module_id) = compilation
-        .module_graph
-        .module_graph_module_by_dependency_id(&id)
-        .map(|m| m.id(&compilation.chunk_graph).to_string())
-      {
-        code_generatable_context
-          .runtime_requirements
-          .insert(RuntimeGlobals::BASE_URI);
-        code_gen.visitors.push(
-          create_javascript_visitor!(exact &self.ast_path, visit_mut_new_expr(n: &mut NewExpr) {
-                let Some(args) = &mut n.args else { return };
+    runtime_requirements.insert(RuntimeGlobals::REQUIRE);
 
-                if let (Some(first), Some(second)) = (args.first(), args.get(1)) {
-                  let path_span = first.span();
-                  let meta_span = second.span();
-
-                  let require_call = CallExpr {
-                    span: path_span,
-                    callee: Callee::Expr(quote_ident!(RuntimeGlobals::REQUIRE).into()),
-                    args: vec![ExprOrSpread {
-                      spread: None,
-                      expr: quote_str!(&*module_id).into(),
-                    }],
-                    type_args: None,
-                  };
-
-                  args[0] = ExprOrSpread {
-                    spread: None,
-                    expr: require_call.into(),
-                  };
-
-                  args[1] = ExprOrSpread {
-                    spread: None,
-                    expr: member_expr!(meta_span, __webpack_require__.b),
-                  };
-                }
-          }),
-        );
-      }
+    if self.relative {
+      runtime_requirements.insert(RuntimeGlobals::RELATIVE_URL);
+      source.replace(
+        self.range.start,
+        self.range.end,
+        format!(
+          "/* asset import */ new {}({}({}))",
+          RuntimeGlobals::RELATIVE_URL,
+          RuntimeGlobals::REQUIRE,
+          module_id(compilation, &self.id, &self.request, false),
+        )
+        .as_str(),
+        None,
+      );
+    } else {
+      runtime_requirements.insert(RuntimeGlobals::BASE_URI);
+      source.replace(
+        self.range_url.start,
+        self.range_url.end,
+        format!(
+          "/* asset import */{}({}), {}",
+          RuntimeGlobals::REQUIRE,
+          module_id(compilation, &self.id, &self.request, false),
+          RuntimeGlobals::BASE_URI
+        )
+        .as_str(),
+        None,
+      );
     }
+  }
 
-    Ok(code_gen)
+  fn dependency_id(&self) -> Option<DependencyId> {
+    Some(self.id)
+  }
+
+  fn update_hash(
+    &self,
+    _hasher: &mut dyn std::hash::Hasher,
+    _compilation: &Compilation,
+    _runtime: Option<&RuntimeSpec>,
+  ) {
   }
 }
+
+impl AsContextDependency for URLDependency {}

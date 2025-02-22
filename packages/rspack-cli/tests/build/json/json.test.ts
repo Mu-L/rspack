@@ -1,7 +1,7 @@
 import { existsSync } from "fs";
-import { run, readFile } from "../../utils/test-utils";
-
 import { resolve } from "path";
+import { readFile, run } from "../../utils/test-utils";
+
 const successMessage = "stats are successfully stored as json to stats.json";
 
 describe("json", () => {
@@ -10,7 +10,6 @@ describe("json", () => {
 			"--json",
 			"stats.json"
 		]);
-		debugger;
 		expect(exitCode).toBe(0);
 		expect(stderr).toContain(successMessage);
 		expect(stdout).toBeFalsy();

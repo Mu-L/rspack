@@ -1,21 +1,46 @@
 {
   "name": "@rspack/core",
-  "version": "0.1.11",
+  "version": "1.2.5",
   "webpackVersion": "5.75.0",
   "license": "MIT",
-  "description": "A Fast Rust-based Web Bundler",
+  "description": "The fast Rust-based web bundler with webpack-compatible API",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./hot/*": "./hot/*.js",
+    "./hot/*.js": "./hot/*.js",
+    "./package.json": "./package.json",
+    "./module": "./module.d.ts"
+  },
   "scripts": {
-    "build": "tsc",
-    "prepare": "pnpm precompile-schema",
-    "dev": "tsc -w",
-    "test": "NODE_OPTIONS=--experimental-vm-modules jest --runInBand",
-    "precompile-schema": "node ./scripts/precompile-schema.js"
+    "build": "tsc -b ./tsconfig.build.json && tsc-alias -p tsconfig.build.json && tsup && npm run prepare-container-runtime",
+    "build:force": "tsc -b ./tsconfig.build.json --force && tsc-alias -p tsconfig.build.json && tsup && npm run prepare-container-runtime",
+    "dev": "pnpm run --stream /^dev:.*/",
+    "dev:types": "tsc -w",
+    "dev:js": "tsup --watch",
+    "prepare": "prebundle",
+    "prepare-container-runtime": "node ./scripts/prepare-container-runtime.js",
+    "doc-coverage": "tsx ./scripts/check-documentation-coverage.ts",
+    "api-extractor": "api-extractor run --verbose",
+    "api-extractor:ci": "api-extractor run --verbose || diff temp/core.api.md etc/core.api.md"
   },
   "files": [
-    "dist"
+    "dist",
+    "hot",
+    "compiled",
+    "module.d.ts"
   ],
+  "engines": {
+    "node": ">=16.0.0"
+  },
   "homepage": "https://rspack.dev",
   "bugs": "https://github.com/web-infra-dev/rspack/issues",
   "repository": {
@@ -24,53 +49,44 @@
     "directory": "packages/rspack"
   },
   "devDependencies": {
-    "@rspack/core": "workspace:*",
-    "@rspack/plugin-minify": "workspace:^",
-    "@rspack/plugin-node-polyfill": "workspace:^",
-    "@rspack/postcss-loader": "workspace:^",
-    "@types/node": "16",
-    "@types/rimraf": "3.0.2",
-    "@types/sinon": "10.0.13",
-    "@types/watchpack": "^2.4.0",
-    "@types/webpack-sources": "3.2.0",
-    "@types/ws": "8.5.3",
-    "ajv": "^8.12.0",
-    "babel-loader": "^9.1.0",
-    "babel-plugin-import": "^1.13.5",
-    "chokidar": "3.5.3",
-    "copy-webpack-plugin": "5",
-    "file-loader": "^6.2.0",
-    "jest-serializer-path": "^0.1.15",
-    "less": "4.1.3",
-    "less-loader": "^11.1.0",
-    "postcss-loader": "^7.0.2",
-    "postcss-pxtorem": "^6.0.0",
-    "react-relay": "^14.1.0",
-    "rimraf": "3.0.2",
-    "sass": "^1.56.2",
-    "sass-loader": "^13.2.0",
-    "sinon": "14.0.0",
-    "source-map": "^0.7.4",
-    "terser": "5.16.1",
-    "ts-node": "10.9.1",
-    "util": "0.12.5",
-    "uvu": "0.5.6",
-    "wast-loader": "^1.11.4",
-    "webpack-dev-server": "4.13.1"
+    "@rspack/tracing": "workspace:*",
+    "@swc/core": "1.10.18",
+    "@swc/types": "0.1.17",
+    "@types/graceful-fs": "4.1.9",
+    "@types/watchpack": "^2.4.4",
+    "@types/webpack-sources": "3.2.3",
+    "browserslist": "^4.24.4",
+    "cross-env": "^7.0.3",
+    "enhanced-resolve": "5.18.1",
+    "graceful-fs": "^4.2.11",
+    "json-parse-even-better-errors": "^3.0.2",
+    "prebundle": "^1.2.7",
+    "tsc-alias": "^1.8.10",
+    "tsup": "^8.3.6",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3",
+    "watchpack": "^2.4.2",
+    "webpack-dev-server": "5.0.4",
+    "webpack-sources": "3.2.3",
+    "zod": "^3.24.2",
+    "zod-validation-error": "3.4.0"
   },
   "dependencies": {
+    "@module-federation/runtime-tools": "0.8.4",
     "@rspack/binding": "workspace:*",
-    "@rspack/dev-client": "workspace:*",
-    "compare-versions": "6.0.0-rc.1",
-    "@swc/helpers": "0.5.1",
-    "browserslist": "^4.21.3",
-    "enhanced-resolve": "5.12.0",
-    "graceful-fs": "4.2.10",
-    "neo-async": "2.6.2",
-    "react-refresh": "0.14.0",
-    "schema-utils": "^4.0.0",
-    "tapable": "2.2.1",
-    "watchpack": "^2.4.0",
-    "webpack-sources": "3.2.3"
+    "@rspack/lite-tapable": "1.0.1",
+    "caniuse-lite": "^1.0.30001700"
+  },
+  "peerDependencies": {
+    "@rspack/tracing": "^1.x",
+    "@swc/helpers": ">=0.5.1"
+  },
+  "peerDependenciesMeta": {
+    "@swc/helpers": {
+      "optional": true
+    },
+    "@rspack/tracing": {
+      "optional": true
+    }
   }
 }

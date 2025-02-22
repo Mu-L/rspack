@@ -3,19 +3,42 @@
 "use strict";
 
 const os = require("os");
-const stripAnsi = require("strip-ansi");
+const { stripVTControlCharacters: stripAnsi } = require("node:util");
 const path = require("path");
 const fs = require("fs");
 const execa = require("execa");
-const internalIp = require("internal-ip");
 const { exec } = require("child_process");
 const { node: execaNode } = execa;
 const { Writable } = require("readable-stream");
 const concat = require("concat-stream");
 
-const RSPACK_PATH = path.resolve(__dirname, "../../bin/rspack");
+const RSPACK_PATH = path.resolve(__dirname, "../../bin/rspack.js");
 const ENABLE_LOG_COMPILATION = process.env.ENABLE_PIPE || false;
 const isWindows = process.platform === "win32";
+
+function getInternalIpV4(): string | undefined {
+	const nets = os.networkInterfaces();
+	for (const name of Object.keys(nets)) {
+		for (const net of nets[name] ?? []) {
+			if (net.family === "IPv4" && !net.internal) {
+				return net.address;
+			}
+		}
+	}
+	return undefined;
+}
+
+function getInternalIpV6(): string | undefined {
+	const nets = os.networkInterfaces();
+	for (const name of Object.keys(nets)) {
+		for (const net of nets[name] ?? []) {
+			if (net.family === "IPv6" && !net.internal) {
+				return net.address;
+			}
+		}
+	}
+	return undefined;
+}
 
 const hyphenToUpperCase = name => {
 	if (!name) {
@@ -43,7 +66,7 @@ const processKill = process => {
  * @param {Object<string, any>} options Options for tests
  * @returns {Promise}
  */
-const createProcess = (cwd, args, options) => {
+const createProcess = (cwd, args, options, env) => {
 	const { nodeOptions = [] } = options;
 	const processExecutor = nodeOptions.length ? execaNode : execa;
 	return processExecutor(RSPACK_PATH, args, {
@@ -51,7 +74,7 @@ const createProcess = (cwd, args, options) => {
 		reject: false,
 		stdio: ENABLE_LOG_COMPILATION ? "inherit" : "pipe",
 		maxBuffer: Infinity,
-		env: { RSPACK_CLI_HELP_WIDTH: 1024 },
+		env: { RSPACK_CLI_HELP_WIDTH: 1024, ...env },
 		...options
 	});
 };
@@ -64,8 +87,8 @@ const createProcess = (cwd, args, options) => {
  * @param {Object<string, any>} options Options for tests
  * @returns {Promise}
  */
-const run = async (cwd, args: string[] = [], options = {}) => {
-	return createProcess(cwd, args, options);
+const run = async (cwd, args: string[] = [], options = {}, env = {}) => {
+	return createProcess(cwd, args, options, env);
 };
 
 /**
@@ -76,8 +99,8 @@ const run = async (cwd, args: string[] = [], options = {}) => {
  * @param {Object<string, any>} options Options for tests
  * @returns {Promise}
  */
-const runAndGetProcess = (cwd, args = [], options = {}) => {
-	return createProcess(cwd, args, options);
+const runAndGetProcess = (cwd, args = [], options = {}, env = {}) => {
+	return createProcess(cwd, args, options, env);
 };
 
 /**
@@ -91,10 +114,11 @@ const runAndGetProcess = (cwd, args = [], options = {}) => {
 const runWatch = (
 	cwd,
 	args: string[] = [],
-	options: Record<string, any> = {}
+	options: Record<string, any> = {},
+	env: Record<string, any> = {}
 ): any => {
 	return new Promise((resolve, reject) => {
-		const process = createProcess(cwd, args, options);
+		const process = createProcess(cwd, args, options, env);
 		const outputKillStr = options.killString || /rspack \d+\.\d+\.\d/;
 
 		process.stdout.pipe(
@@ -271,7 +295,7 @@ const normalizeStderr = stderr => {
 	let normalizedStderr = stripAnsi(stderr);
 	normalizedStderr = normalizeCwd(normalizedStderr);
 
-	const networkIPv4 = internalIp.v4.sync();
+	const networkIPv4 = getInternalIpV4();
 
 	if (networkIPv4) {
 		normalizedStderr = normalizedStderr.replace(
@@ -280,7 +304,7 @@ const normalizeStderr = stderr => {
 		);
 	}
 
-	const networkIPv6 = internalIp.v6.sync();
+	const networkIPv6 = getInternalIpV6();
 
 	if (networkIPv6) {
 		normalizedStderr = normalizedStderr.replace(

@@ -1,7 +1,7 @@
 // @ts-nocheck
-const path = require("path");
-const fs = require("fs");
-const assert = require("assert");
+const path = require("node:path");
+const fs = require("node:fs");
+const assert = require("node:assert");
 
 // Generates binding packages based on artifacts.
 // Note: it's dedicated to work with pnpm workspaces.
@@ -82,6 +82,9 @@ try {
 	fs.mkdirSync(NPM);
 } catch (e) {}
 
+// Releasing bindings
+const releasingPackages = [];
+
 const bindings = fs
 	.readdirSync(ARTIFACTS, {
 		withFileTypes: true
@@ -89,19 +92,19 @@ const bindings = fs
 	.filter(item => item.isDirectory())
 	.map(item => path.join(ARTIFACTS, item.name));
 
-let optionalDependencies = {};
+const optionalDependencies = {};
 
 for (const binding of bindings) {
 	// bindings-x86_64-unknown-linux-musl
-	let files = fs.readdirSync(binding);
+	const files = fs.readdirSync(binding);
 	assert(files.length === 1, `Expected only one file in ${binding}`);
 
 	// rspack.linux-x64-musl.node
-	let file = files[0];
+	const file = files[0];
 	assert(path.extname(file) === ".node", `Expected .node file in ${binding}`);
-	let binary = fs.readFileSync(path.join(binding, file));
+	const binary = fs.readFileSync(path.join(binding, file));
 
-	let name = path.basename(binding);
+	const name = path.basename(binding);
 	assert(name.startsWith("bindings-"));
 
 	// x86_64-unknown-linux-musl
@@ -116,7 +119,7 @@ for (const binding of bindings) {
 		platformArchABI
 	} = parseTriple(name.slice(9));
 	assert(
-		file.split(".")[1] == platformArchABI,
+		file.split(".")[1] === platformArchABI,
 		`Binding is not matched with triple (expected: rspack.${platformArchABI}.node, got: ${file})`
 	);
 
@@ -126,10 +129,9 @@ for (const binding of bindings) {
 		fs.mkdirSync(output);
 	} catch (e) {}
 
-	const coreJson = require(path.resolve(
-		__dirname,
-		"../packages/rspack/package.json"
-	));
+	const coreJson = require(
+		path.resolve(__dirname, "../packages/rspack/package.json")
+	);
 	const pkgJson = {};
 	pkgJson.name = `@rspack/binding-${platformArchABI}`;
 	pkgJson.version = coreJson.version;
@@ -156,13 +158,15 @@ for (const binding of bindings) {
 	fs.writeFileSync(`${output}/${pkgJson.main}`, binary);
 
 	const README = `<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://lf3-static.bytednsdoc.com/obj/eden-cn/rjhwzy/ljhwZthlaukjlkulzlp/rspack-banner-1610-dark.png">
-  <img alt="Rspack Banner" src="https://lf3-static.bytednsdoc.com/obj/eden-cn/rjhwzy/ljhwZthlaukjlkulzlp/rspack-banner-1610.png">
+  <source media="(prefers-color-scheme: dark)" srcset="https://assets.rspack.dev/rspack/rspack-banner-plain-dark.png">
+  <img alt="Rspack Banner" src="https://assets.rspack.dev/rspack/rspack-banner-plain-light.png">
 </picture>
 
 # ${pkgJson.name}
 
-Node binding for rspack.
+Private node binding crate for rspack.
+
+This package does *NOT* follow [semantic versioning](https://semver.org/).
 
 ## Documentation
 
@@ -174,13 +178,37 @@ Rspack is [MIT licensed](https://github.com/web-infra-dev/rspack/blob/main/LICEN
 `;
 
 	fs.writeFileSync(`${output}/README.md`, README);
+	releasingPackages.push(pkgJson.name);
 }
 
-let bindingJsonPath = path.resolve(
+// Determine whether to release or not based on the CI build result.
+// Validating not releasable bindings
+const dirent = fs.readdirSync(NPM, {
+	withFileTypes: true
+});
+for (const item of dirent) {
+	if (item.isDirectory()) {
+		const dir = path.join(NPM, item.name);
+		const pkg = require(`${dir}/package.json`);
+
+		if (releasingPackages.includes(pkg.name)) {
+			// releasing
+			console.info(`Releasing package: ${pkg.name}`);
+		} else {
+			pkg.private = true;
+			console.info(
+				`Skipping package: ${pkg.name}. (Reason: local package, but its artifact is not available.)`
+			);
+			fs.writeFileSync(`${dir}/package.json`, JSON.stringify(pkg, null, 2));
+		}
+	}
+}
+
+const bindingJsonPath = path.resolve(
 	__dirname,
 	"../crates/node_binding/package.json"
 );
-let bindingJson = require(bindingJsonPath);
+const bindingJson = require(bindingJsonPath);
 
 // The original `optionalDependencies` field in `package.json` is used to publish locally, so we have to override it for CI.
 bindingJson.optionalDependencies = optionalDependencies;

@@ -1,0 +1,18 @@
+{
+  "name": "rspack-vue-starter",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "cross-env NODE_ENV=development rspack serve",
+    "build": "cross-env NODE_ENV=production rspack build"
+  },
+  "dependencies": {
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@rspack/cli": "workspace:*",
+    "@rspack/core": "workspace:*",
+    "cross-env": "^7.0.3",
+    "vue-loader": "^17.4.2"
+  }
+}

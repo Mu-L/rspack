@@ -1,347 +1,201 @@
-use std::{
-  fmt::{self, Debug},
-  path::{Path, PathBuf},
-  sync::Arc,
-};
+use std::{fmt::Debug, path::PathBuf, sync::Arc};
 
-use derivative::Derivative;
-use nodejs_resolver::DescriptionData;
-use once_cell::sync::OnceCell;
-use rspack_error::{
-  internal_error, Diagnostic, IntoTWithDiagnosticArray, Result, TWithDiagnosticArray,
-};
+use rspack_error::{error, IntoTWithDiagnosticArray, Result, TWithDiagnosticArray};
+use rspack_fs::ReadableFileSystem;
 use rspack_sources::SourceMap;
-use rustc_hash::FxHashSet as HashSet;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use tokio::task::spawn_blocking;
 
 use crate::{
-  content::Content,
-  loader::{Loader, LoaderItem, LoaderItemList},
+  content::{AdditionalData, Content, ResourceData},
+  context::{LoaderContext, State},
+  loader::{Loader, LoaderItem},
   plugin::LoaderRunnerPlugin,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Scheme {
-  None,
-  Data,
-  File,
-  Custom(String),
-  // Http,
-}
-
-impl From<&str> for Scheme {
-  fn from(value: &str) -> Self {
-    match value {
-      "" => Self::None,
-      "data" => Self::Data,
-      "file" => Self::File,
-      v => Self::Custom(v.to_string()),
-    }
-  }
-}
-
-impl fmt::Display for Scheme {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(
-      f,
-      "{}",
-      match self {
-        Self::None => "",
-        Self::Data => "data",
-        Self::File => "file",
-        Self::Custom(v) => v,
-      }
-    )
-  }
-}
-
-pub fn get_scheme(specifier: &str) -> Scheme {
-  url::Url::parse(specifier)
-    .map(|url| Scheme::from(url.scheme()))
-    .unwrap_or(Scheme::None)
-}
-
-#[derive(Debug, Clone)]
-pub struct ResourceData {
-  /// Resource with absolute path, query and fragment
-  pub resource: String,
-  /// Absolute resource path only
-  pub resource_path: PathBuf,
-  /// Resource query with `?` prefix
-  pub resource_query: Option<String>,
-  /// Resource fragment with `#` prefix
-  pub resource_fragment: Option<String>,
-  pub resource_description: Option<Arc<DescriptionData>>,
-  pub mimetype: Option<String>,
-  pub parameters: Option<String>,
-  pub encoding: Option<String>,
-  pub encoded_content: Option<String>,
-  scheme: OnceCell<Scheme>,
-}
-
-impl ResourceData {
-  pub fn new(resource: String, path: PathBuf) -> Self {
-    Self {
-      resource,
-      resource_path: path,
-      resource_query: None,
-      resource_fragment: None,
-      resource_description: None,
-      mimetype: None,
-      parameters: None,
-      encoding: None,
-      encoded_content: None,
-      scheme: OnceCell::new(),
-    }
-  }
-
-  pub fn get_scheme(&self) -> &Scheme {
-    self.scheme.get_or_init(|| get_scheme(&self.resource))
-  }
-
-  pub fn query(mut self, v: String) -> Self {
-    self.resource_query = Some(v);
-    self
-  }
-
-  pub fn query_optional(mut self, v: Option<String>) -> Self {
-    self.resource_query = v;
-    self
-  }
-
-  pub fn fragment(mut self, v: String) -> Self {
-    self.resource_fragment = Some(v);
-    self
-  }
-
-  pub fn fragment_optional(mut self, v: Option<String>) -> Self {
-    self.resource_fragment = v;
-    self
-  }
-
-  pub fn description(mut self, v: Arc<DescriptionData>) -> Self {
-    self.resource_description = Some(v);
-    self
-  }
-
-  pub fn description_optional(mut self, v: Option<Arc<DescriptionData>>) -> Self {
-    self.resource_description = v;
-    self
-  }
-
-  pub fn mimetype(mut self, v: String) -> Self {
-    self.mimetype = Some(v);
-    self
-  }
-
-  pub fn parameters(mut self, v: String) -> Self {
-    self.parameters = Some(v);
-    self
-  }
-
-  pub fn encoding(mut self, v: String) -> Self {
-    self.encoding = Some(v);
-    self
-  }
-
-  pub fn encoded_content(mut self, v: String) -> Self {
-    self.encoded_content = Some(v);
-    self
-  }
-}
-
-#[derive(Derivative)]
-#[derivative(Debug)]
-pub struct LoaderContext<'c, C> {
-  /// Content of loader, represented by string or buffer
-  /// Content should always be exist if at normal stage,
-  /// It will be `None` at pitching stage.
-  pub content: Option<Content>,
-
-  /// The resource part of the request, including query and fragment.
-  /// E.g. /abc/resource.js?query=1#some-fragment
-  pub resource: &'c str,
-  /// The resource part of the request.
-  /// E.g. /abc/resource.js
-  pub resource_path: &'c Path,
-  /// The query of the request
-  /// E.g. query=1
-  pub resource_query: Option<&'c str>,
-  /// The fragment of the request
-  /// E.g. some-fragment
-  pub resource_fragment: Option<&'c str>,
-
-  pub context: C,
-  pub source_map: Option<SourceMap>,
-  pub additional_data: Option<String>,
-  pub cacheable: bool,
-
-  pub file_dependencies: HashSet<PathBuf>,
-  pub context_dependencies: HashSet<PathBuf>,
-  pub missing_dependencies: HashSet<PathBuf>,
-  pub build_dependencies: HashSet<PathBuf>,
-
-  pub asset_filenames: HashSet<String>,
-
-  pub(crate) loader_index: usize,
-  pub(crate) loader_items: LoaderItemList<'c, C>,
-  #[derivative(Debug = "ignore")]
-  pub(crate) plugins: &'c [Box<dyn LoaderRunnerPlugin>],
-  pub(crate) resource_data: &'c ResourceData,
-
-  pub diagnostic: Vec<Diagnostic>,
-}
-
-impl<'c, C> LoaderContext<'c, C> {
-  pub fn remaining_request(&self) -> LoaderItemList<'_, C> {
-    if self.loader_index >= self.loader_items.len() - 1 {
-      return Default::default();
-    }
-    LoaderItemList(&self.loader_items[self.loader_index + 1..])
-  }
-
-  pub fn current_request(&self) -> LoaderItemList<'_, C> {
-    LoaderItemList(&self.loader_items[self.loader_index..])
-  }
-
-  pub fn previous_request(&self) -> LoaderItemList<'_, C> {
-    LoaderItemList(&self.loader_items[..self.loader_index])
-  }
-
-  pub fn request(&self) -> LoaderItemList<'_, C> {
-    LoaderItemList(&self.loader_items[..])
-  }
-
-  pub fn current_loader(&self) -> &LoaderItem<C> {
-    &self.loader_items[self.loader_index]
-  }
-
-  pub fn loader_index(&self) -> usize {
-    self.loader_index
-  }
-}
-
-async fn process_resource<C: Send>(loader_context: &mut LoaderContext<'_, C>) -> Result<()> {
-  for plugin in loader_context.plugins {
-    if let Some(processed_resource) = plugin
-      .process_resource(loader_context.resource_data)
-      .await?
+impl<Context> LoaderContext<Context> {
+  async fn start_yielding(&mut self) -> Result<bool> {
+    if let Some(plugin) = &self.plugin
+      && plugin.should_yield(self)?
     {
-      loader_context.content = Some(processed_resource);
+      plugin.clone().start_yielding(self).await?;
+      return Ok(true);
+    }
+    Ok(false)
+  }
+}
+
+// #[tracing::instrument("LoaderRunner:process_resource",
+//   skip_all,
+//   fields(module.resource = loader_context.resource_data.resource),
+//   level = "trace"
+// )]
+async fn process_resource<Context: Send>(
+  loader_context: &mut LoaderContext<Context>,
+  fs: Arc<dyn ReadableFileSystem>,
+) -> Result<()> {
+  if let Some(plugin) = &loader_context.plugin
+    && let Some(processed_resource) = plugin
+      .process_resource(&loader_context.resource_data)
+      .await?
+  {
+    loader_context.content = Some(processed_resource);
+  }
+
+  let resource_data = &loader_context.resource_data;
+  if loader_context.content.is_none() {
+    if let Some(resource_path) = resource_data.resource_path.as_deref()
+      && !resource_path.as_str().is_empty()
+    {
+      let resource_path_owned = resource_path.to_owned();
+      // use spawn_blocking to avoid block,see https://docs.rs/tokio/latest/src/tokio/fs/read.rs.html#48
+      let result = spawn_blocking(move || fs.read(resource_path_owned.as_path()))
+        .await
+        .map_err(|e| error!("{e}, spawn task failed"))?;
+      let result = result.map_err(|e| error!("{e}, failed to read {resource_path}"))?;
+      loader_context.content = Some(Content::from(result));
+    } else if !resource_data.get_scheme().is_none() {
+      let resource = &resource_data.resource;
+      let scheme = resource_data.get_scheme();
+      return Err(error!(
+        r#"Reading from "{resource}" is not handled by plugins (Unhandled scheme).
+Rspack supports "data:" and "file:" URIs by default.
+You may need an additional plugin to handle "{scheme}:" URIs."#
+      ));
     }
   }
 
-  if loader_context.content.is_none() {
-    let result = tokio::fs::read(&loader_context.resource_data.resource_path).await?;
-    loader_context.content = Some(Content::from(result));
-  }
-
-  // Bail out if loader does not exist,
-  // or the last loader has been executed.
-  if loader_context.loader_index == 0
-    && (loader_context.loader_items.get(0).is_none()
-      || loader_context
-        .loader_items
-        .get(0)
-        .map(|loader| loader.normal_executed())
-        .unwrap_or_default())
-  {
-    return Ok(());
-  }
-
-  loader_context.loader_index = loader_context.loader_items.len() - 1;
-  iterate_normal_loaders(loader_context).await
+  Ok(())
 }
 
-async fn create_loader_context<'c, C: 'c>(
-  loader_items: &'c [LoaderItem<C>],
-  resource_data: &'c ResourceData,
-  plugins: &'c [Box<dyn LoaderRunnerPlugin>],
-  context: C,
-) -> Result<LoaderContext<'c, C>> {
+async fn create_loader_context<Context>(
+  loader_items: Vec<LoaderItem<Context>>,
+  resource_data: Arc<ResourceData>,
+  plugin: Option<Arc<dyn LoaderRunnerPlugin<Context = Context>>>,
+  context: Context,
+) -> Result<LoaderContext<Context>> {
   let mut file_dependencies: HashSet<PathBuf> = Default::default();
-  file_dependencies.insert(resource_data.resource_path.clone());
+  if let Some(resource_path) = &resource_data.resource_path
+    && resource_path.is_absolute()
+  {
+    file_dependencies.insert(resource_path.clone().into_std_path_buf());
+  }
 
-  let loader_context = LoaderContext {
+  let mut loader_context = LoaderContext {
+    hot: false,
     cacheable: true,
+    parse_meta: Default::default(),
     file_dependencies,
     context_dependencies: Default::default(),
     missing_dependencies: Default::default(),
     build_dependencies: Default::default(),
-    asset_filenames: Default::default(),
     content: None,
-    resource: &resource_data.resource,
-    resource_path: &resource_data.resource_path,
-    resource_query: resource_data.resource_query.as_deref(),
-    resource_fragment: resource_data.resource_fragment.as_deref(),
     context,
     source_map: None,
     additional_data: None,
+    state: State::Init,
     loader_index: 0,
-    loader_items: LoaderItemList(loader_items),
-    plugins,
+    loader_items,
+    plugin,
     resource_data,
-    diagnostic: vec![],
+    diagnostics: vec![],
   };
+
+  if let Some(plugin) = loader_context.plugin.clone() {
+    plugin.before_all(&mut loader_context)?;
+  }
 
   Ok(loader_context)
 }
 
-#[async_recursion::async_recursion]
-async fn iterate_normal_loaders<C: Send>(loader_context: &mut LoaderContext<'_, C>) -> Result<()> {
-  let current_loader_item = loader_context.current_loader();
+#[tracing::instrument("LoaderRunner:run_loaders", skip_all, level = "trace")]
+pub async fn run_loaders<Context: Send>(
+  loaders: Vec<Arc<dyn Loader<Context>>>,
+  resource_data: Arc<ResourceData>,
+  plugin: Option<Arc<dyn LoaderRunnerPlugin<Context = Context>>>,
+  context: Context,
+  fs: Arc<dyn ReadableFileSystem>,
+) -> Result<TWithDiagnosticArray<LoaderResult>> {
+  let loaders = loaders
+    .into_iter()
+    .map(|i| i.into())
+    .collect::<Vec<LoaderItem<Context>>>();
 
-  if current_loader_item.normal_executed() {
-    if loader_context.loader_index == 0 {
-      return Ok(());
+  let mut cx = create_loader_context(loaders, resource_data, plugin, context).await?;
+
+  loop {
+    match cx.state {
+      State::Init => {
+        cx.state.transition(State::Pitching);
+      }
+      State::Pitching => {
+        if cx.loader_index >= cx.loader_items.len() as i32 {
+          cx.state.transition(State::ProcessResource);
+          continue;
+        }
+
+        if cx.start_yielding().await? {
+          if cx.content.is_some() {
+            cx.state.transition(State::Normal);
+            cx.loader_index -= 1;
+          }
+          continue;
+        }
+
+        if cx.current_loader().pitch_executed() {
+          cx.loader_index += 1;
+          continue;
+        }
+
+        cx.current_loader().set_pitch_executed();
+        let loader = cx.current_loader().loader().clone();
+        loader.pitch(&mut cx).await?;
+        if cx.content.is_some() {
+          cx.state.transition(State::Normal);
+          cx.loader_index -= 1;
+          continue;
+        }
+      }
+      State::ProcessResource => {
+        process_resource(&mut cx, fs.clone()).await?;
+        cx.loader_index = cx.loader_items.len() as i32 - 1;
+        cx.state.transition(State::Normal);
+      }
+      State::Normal => {
+        if cx.loader_index < 0 {
+          cx.state.transition(State::Finished);
+          continue;
+        }
+
+        if cx.loader_index == 0 && cx.current_loader().normal_executed() {
+          cx.state.transition(State::Finished);
+          continue;
+        }
+
+        if cx.start_yielding().await? {
+          continue;
+        }
+
+        if cx.current_loader().normal_executed() {
+          cx.loader_index -= 1;
+          continue;
+        }
+
+        cx.current_loader().set_normal_executed();
+        let loader = cx.current_loader().loader().clone();
+        loader.run(&mut cx).await?;
+        if !cx.current_loader().finish_called() {
+          // If nothing is returned from this loader,
+          // we set everything to [None] and move to the next loader.
+          // This mocks the behavior of webpack loader-runner.
+          cx.finish_with_empty();
+        }
+      }
+      State::Finished => break,
     }
-    loader_context.loader_index -= 1;
-    return iterate_normal_loaders(loader_context).await;
   }
 
-  let loader = current_loader_item.loader.clone();
-  current_loader_item.set_normal_executed();
-  loader.run(loader_context).await?;
-
-  iterate_normal_loaders(loader_context).await
-}
-
-#[async_recursion::async_recursion]
-async fn iterate_pitching_loaders<C: Send>(
-  loader_context: &mut LoaderContext<'_, C>,
-) -> Result<()> {
-  if loader_context.loader_index >= loader_context.loader_items.len() {
-    return process_resource(loader_context).await;
-  }
-
-  let current_loader_item = loader_context.current_loader();
-
-  if current_loader_item.pitch_executed() {
-    loader_context.loader_index += 1;
-    return iterate_pitching_loaders(loader_context).await;
-  }
-
-  let loader = current_loader_item.loader.clone();
-  current_loader_item.set_pitch_executed();
-  loader.pitch(loader_context).await?;
-
-  let current_loader_item = loader_context.current_loader();
-
-  // If pitching loader modifies the content,
-  // runner should skip the remaining pitching loaders
-  // and redirect pipeline to the normal stage.
-  // Or, if a pitching loader finishes the normal stage, then we should execute backwards.
-  // Yes, the second one is a backdoor for JS loaders.
-  if loader_context.content.is_some() || current_loader_item.normal_executed() {
-    if loader_context.loader_index == 0 {
-      return Ok(());
-    }
-    loader_context.loader_index -= 1;
-    iterate_normal_loaders(loader_context).await?;
-  } else {
-    iterate_pitching_loaders(loader_context).await?;
-  }
-
-  Ok(())
+  cx.try_into()
 }
 
 #[derive(Debug)]
@@ -351,21 +205,21 @@ pub struct LoaderResult {
   pub context_dependencies: HashSet<PathBuf>,
   pub missing_dependencies: HashSet<PathBuf>,
   pub build_dependencies: HashSet<PathBuf>,
-  pub asset_filenames: HashSet<String>,
   pub content: Content,
   pub source_map: Option<SourceMap>,
-  pub additional_data: Option<String>,
+  pub additional_data: Option<AdditionalData>,
+  pub parse_meta: HashMap<String, String>,
 }
 
-impl<C> TryFrom<LoaderContext<'_, C>> for TWithDiagnosticArray<LoaderResult> {
+impl<Context> TryFrom<LoaderContext<Context>> for TWithDiagnosticArray<LoaderResult> {
   type Error = rspack_error::Error;
-  fn try_from(loader_context: LoaderContext<'_, C>) -> std::result::Result<Self, Self::Error> {
+  fn try_from(loader_context: LoaderContext<Context>) -> std::result::Result<Self, Self::Error> {
     let content = loader_context.content.ok_or_else(|| {
       if !loader_context.loader_items.is_empty() {
         let loader = loader_context.loader_items[0].to_string();
-        internal_error!("Final loader({loader}) didn't return a Buffer or String")
+        error!("Final loader({loader}) didn't return a Buffer or String")
       } else {
-        internal_error!("Content is not available, it is a bug")
+        panic!("content should be available");
       }
     })?;
 
@@ -376,60 +230,41 @@ impl<C> TryFrom<LoaderContext<'_, C>> for TWithDiagnosticArray<LoaderResult> {
         context_dependencies: loader_context.context_dependencies,
         missing_dependencies: loader_context.missing_dependencies,
         build_dependencies: loader_context.build_dependencies,
-        asset_filenames: loader_context.asset_filenames,
         content,
         source_map: loader_context.source_map,
         additional_data: loader_context.additional_data,
+        parse_meta: loader_context.parse_meta,
       }
-      .with_diagnostic(loader_context.diagnostic),
+      .with_diagnostic(loader_context.diagnostics),
     )
   }
 }
 
-pub async fn run_loaders<C: Send>(
-  loaders: &[Arc<dyn Loader<C>>],
-  resource_data: &ResourceData,
-  plugins: &[Box<dyn LoaderRunnerPlugin>],
-  context: C,
-) -> Result<TWithDiagnosticArray<LoaderResult>> {
-  let loaders = loaders
-    .iter()
-    .map(|i| i.clone().into())
-    .collect::<Vec<LoaderItem<C>>>();
-
-  let mut loader_context =
-    create_loader_context(&loaders[..], resource_data, plugins, context).await?;
-
-  assert!(loader_context.content.is_none());
-  iterate_pitching_loaders(&mut loader_context).await?;
-
-  loader_context.try_into()
-}
-
 #[cfg(test)]
-#[allow(unused)]
 mod test {
   use std::{cell::RefCell, sync::Arc};
 
   use once_cell::sync::OnceCell;
+  use rspack_cacheable::{cacheable, cacheable_dyn};
+  use rspack_collections::{Identifiable, Identifier};
   use rspack_error::Result;
-  use rspack_identifier::{Identifiable, Identifier};
+  use rspack_fs::NativeFileSystem;
 
   use super::{run_loaders, Loader, LoaderContext, ResourceData};
-  use crate::{
-    content::Content,
-    loader::test::{Composed, Custom, Custom2},
-    plugin::LoaderRunnerPlugin,
-    runner::Scheme,
-    DisplayWithSuffix,
-  };
+  use crate::{content::Content, plugin::LoaderRunnerPlugin, AdditionalData};
 
   struct TestContentPlugin;
 
   #[async_trait::async_trait]
   impl LoaderRunnerPlugin for TestContentPlugin {
+    type Context = ();
+
     fn name(&self) -> &'static str {
       "test-content"
+    }
+
+    fn before_all(&self, _context: &mut LoaderContext<Self::Context>) -> Result<()> {
+      Ok(())
     }
 
     async fn process_resource(&self, _resource_data: &ResourceData) -> Result<Option<Content>> {
@@ -438,86 +273,12 @@ mod test {
   }
 
   #[tokio::test]
-  async fn should_have_the_correct_requests() {
-    thread_local! {
-      static IDENTS: RefCell<Vec<String>> = RefCell::default();
-    }
-
-    struct Pitching;
-
-    impl Identifiable for Pitching {
-      fn identifier(&self) -> Identifier {
-        "/rspack/pitching-loader".into()
-      }
-    }
-
-    #[async_trait::async_trait]
-    impl Loader<()> for Pitching {
-      async fn pitch(&self, loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
-        IDENTS.with(|i| {
-          i.borrow_mut()
-            .push(loader_context.remaining_request().to_string());
-          i.borrow_mut()
-            .push(loader_context.previous_request().to_string());
-          i.borrow_mut()
-            .push(loader_context.current_request().to_string());
-          i.borrow_mut().push(
-            loader_context
-              .current_request()
-              .display_with_suffix(loader_context.resource),
-          );
-        });
-        Ok(())
-      }
-    }
-    let c1 = Arc::new(Custom) as Arc<dyn Loader<()>>;
-    let i1 = c1.identifier();
-    let c2 = Arc::new(Custom2) as Arc<dyn Loader<()>>;
-    let i2 = c2.identifier();
-    let c3 = Arc::new(Composed) as Arc<dyn Loader<()>>;
-    let i3 = c3.identifier();
-    let p1 = Arc::new(Pitching) as Arc<dyn Loader<()>>;
-    let i0 = p1.identifier();
-
-    let rs = ResourceData {
-      scheme: OnceCell::new(),
-      resource: "/rspack/main.js?abc=123#efg".to_owned(),
-      resource_description: None,
-      resource_fragment: None,
-      resource_query: None,
-      resource_path: Default::default(),
-      mimetype: None,
-      parameters: None,
-      encoding: None,
-      encoded_content: None,
-    };
-
-    run_loaders(&[c1, p1, c2, c3], &rs, &[Box::new(TestContentPlugin)], ())
-      .await
-      .unwrap();
-
-    IDENTS.with(|i| {
-      let i = i.borrow();
-      // remaining request
-      let expected = "".to_owned() + &**i2 + "!" + &**i3;
-      assert_eq!(i[0], expected);
-      // previous request
-      let expected = "".to_owned() + &**i1;
-      assert_eq!(i[1], expected);
-      // current request
-      let expected = "".to_owned() + &**i0 + "!" + &**i2 + "!" + &**i3;
-      assert_eq!(i[2], expected);
-      let expected = expected + "!" + &*rs.resource;
-      assert_eq!(i[3], expected);
-    });
-  }
-
-  #[tokio::test]
   async fn should_have_the_right_execution_order() {
     thread_local! {
       static IDENTS: RefCell<Vec<String>> = RefCell::default();
     }
 
+    #[cacheable]
     struct Pitching;
 
     impl Identifiable for Pitching {
@@ -526,14 +287,16 @@ mod test {
       }
     }
 
+    #[cacheable_dyn]
     #[async_trait::async_trait]
     impl Loader<()> for Pitching {
-      async fn pitch(&self, loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
+      async fn pitch(&self, _loader_context: &mut LoaderContext<()>) -> Result<()> {
         IDENTS.with(|i| i.borrow_mut().push("pitch1".to_string()));
         Ok(())
       }
     }
 
+    #[cacheable]
     struct Pitching2;
 
     impl Identifiable for Pitching2 {
@@ -542,14 +305,16 @@ mod test {
       }
     }
 
+    #[cacheable_dyn]
     #[async_trait::async_trait]
     impl Loader<()> for Pitching2 {
-      async fn pitch(&self, loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
+      async fn pitch(&self, _loader_context: &mut LoaderContext<()>) -> Result<()> {
         IDENTS.with(|i| i.borrow_mut().push("pitch2".to_string()));
         Ok(())
       }
     }
 
+    #[cacheable]
     struct Normal;
 
     impl Identifiable for Normal {
@@ -558,14 +323,16 @@ mod test {
       }
     }
 
+    #[cacheable_dyn]
     #[async_trait::async_trait]
     impl Loader<()> for Normal {
-      async fn run(&self, loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
+      async fn run(&self, _loader_context: &mut LoaderContext<()>) -> Result<()> {
         IDENTS.with(|i| i.borrow_mut().push("normal1".to_string()));
         Ok(())
       }
     }
 
+    #[cacheable]
     struct Normal2;
 
     impl Identifiable for Normal2 {
@@ -574,14 +341,16 @@ mod test {
       }
     }
 
+    #[cacheable_dyn]
     #[async_trait::async_trait]
     impl Loader<()> for Normal2 {
-      async fn run(&self, loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
+      async fn run(&self, _loader_context: &mut LoaderContext<()>) -> Result<()> {
         IDENTS.with(|i| i.borrow_mut().push("normal2".to_string()));
         Ok(())
       }
     }
 
+    #[cacheable]
     struct PitchNormalBase;
 
     impl Identifiable for PitchNormalBase {
@@ -590,19 +359,21 @@ mod test {
       }
     }
 
+    #[cacheable_dyn]
     #[async_trait::async_trait]
     impl Loader<()> for PitchNormalBase {
-      async fn run(&self, loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
+      async fn run(&self, _loader_context: &mut LoaderContext<()>) -> Result<()> {
         IDENTS.with(|i| i.borrow_mut().push("pitch-normal-base-normal".to_string()));
         Ok(())
       }
 
-      async fn pitch(&self, loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
+      async fn pitch(&self, _loader_context: &mut LoaderContext<()>) -> Result<()> {
         IDENTS.with(|i| i.borrow_mut().push("pitch-normal-base-pitch".to_string()));
         Ok(())
       }
     }
 
+    #[cacheable]
     struct PitchNormal;
 
     impl Identifiable for PitchNormal {
@@ -611,20 +382,22 @@ mod test {
       }
     }
 
+    #[cacheable_dyn]
     #[async_trait::async_trait]
     impl Loader<()> for PitchNormal {
-      async fn run(&self, loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
+      async fn run(&self, _loader_context: &mut LoaderContext<()>) -> Result<()> {
         IDENTS.with(|i| i.borrow_mut().push("pitch-normal-normal".to_string()));
         Ok(())
       }
 
-      async fn pitch(&self, loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
+      async fn pitch(&self, loader_context: &mut LoaderContext<()>) -> Result<()> {
         IDENTS.with(|i| i.borrow_mut().push("pitch-normal-pitch".to_string()));
         loader_context.content = Some(Content::Buffer(vec![]));
         Ok(())
       }
     }
 
+    #[cacheable]
     struct PitchNormal2;
 
     impl Identifiable for PitchNormal2 {
@@ -633,14 +406,15 @@ mod test {
       }
     }
 
+    #[cacheable_dyn]
     #[async_trait::async_trait]
     impl Loader<()> for PitchNormal2 {
-      async fn run(&self, loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
+      async fn run(&self, _loader_context: &mut LoaderContext<()>) -> Result<()> {
         IDENTS.with(|i| i.borrow_mut().push("pitch-normal-normal-2".to_string()));
         Ok(())
       }
 
-      async fn pitch(&self, loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
+      async fn pitch(&self, loader_context: &mut LoaderContext<()>) -> Result<()> {
         IDENTS.with(|i| i.borrow_mut().push("pitch-normal-pitch-2".to_string()));
         loader_context.content = Some(Content::Buffer(vec![]));
         Ok(())
@@ -652,7 +426,7 @@ mod test {
     let p1 = Arc::new(Pitching) as Arc<dyn Loader<()>>;
     let p2 = Arc::new(Pitching2) as Arc<dyn Loader<()>>;
 
-    let rs = ResourceData {
+    let rs = Arc::new(ResourceData {
       scheme: OnceCell::new(),
       resource: "/rspack/main.js?abc=123#efg".to_owned(),
       resource_description: None,
@@ -663,11 +437,19 @@ mod test {
       parameters: None,
       encoding: None,
       encoded_content: None,
-    };
+    });
 
-    run_loaders::<()>(&[p1, p2, c1, c2], &rs, &[Box::new(TestContentPlugin)], ())
-      .await
-      .unwrap();
+    // Ignore error: Final loader didn't return a Buffer or String
+    assert!(run_loaders(
+      vec![p1, p2, c1, c2],
+      rs.clone(),
+      Some(Arc::new(TestContentPlugin)),
+      (),
+      Arc::new(NativeFileSystem::new(false))
+    )
+    .await
+    .err()
+    .is_some());
     IDENTS.with(|i| assert_eq!(*i.borrow(), &["pitch1", "pitch2", "normal2", "normal1"]));
     IDENTS.with(|i| i.borrow_mut().clear());
 
@@ -675,9 +457,17 @@ mod test {
     let p2 = Arc::new(PitchNormal) as Arc<dyn Loader<()>>;
     let p3 = Arc::new(PitchNormal2) as Arc<dyn Loader<()>>;
 
-    run_loaders::<()>(&[p1, p2, p3], &rs, &[Box::new(TestContentPlugin)], ())
-      .await
-      .unwrap();
+    // Ignore error: Final loader didn't return a Buffer or String
+    assert!(run_loaders(
+      vec![p1, p2, p3],
+      rs.clone(),
+      Some(Arc::new(TestContentPlugin)),
+      (),
+      Arc::new(NativeFileSystem::new(false))
+    )
+    .await
+    .err()
+    .is_some());
     IDENTS.with(|i| {
       // should not execute p3, as p2 pitched successfully.
       assert!(!i.borrow().contains(&"pitch-normal-normal-2".to_string()));
@@ -690,5 +480,144 @@ mod test {
       // p2 pitched successfully.
       assert_eq!(i.borrow()[1], "pitch-normal-pitch".to_string());
     });
+  }
+
+  #[tokio::test]
+  async fn should_able_to_consume_additional_data() {
+    #[cacheable]
+    struct Normal;
+
+    impl Identifiable for Normal {
+      fn identifier(&self) -> Identifier {
+        "/rspack/normal-loader1".into()
+      }
+    }
+
+    #[cacheable_dyn]
+    #[async_trait::async_trait]
+    impl Loader<()> for Normal {
+      async fn run(&self, loader_context: &mut LoaderContext<()>) -> Result<()> {
+        let data = loader_context
+          .additional_data
+          .as_ref()
+          .unwrap()
+          .get::<&str>()
+          .unwrap();
+        assert_eq!(*data, "additional-data");
+        loader_context.finish_with(("".to_string(), None, None));
+        Ok(())
+      }
+    }
+
+    #[cacheable]
+    struct Normal2;
+
+    impl Identifiable for Normal2 {
+      fn identifier(&self) -> Identifier {
+        "/rspack/normal-loader2".into()
+      }
+    }
+
+    #[cacheable_dyn]
+    #[async_trait::async_trait]
+    impl Loader<()> for Normal2 {
+      async fn run(&self, loader_context: &mut LoaderContext<()>) -> Result<()> {
+        let mut additional_data: AdditionalData = Default::default();
+        additional_data.insert("additional-data");
+        loader_context.finish_with(("".to_string(), None, Some(additional_data)));
+        Ok(())
+      }
+    }
+
+    let rs = Arc::new(ResourceData {
+      scheme: OnceCell::new(),
+      resource: "/rspack/main.js?abc=123#efg".to_owned(),
+      resource_description: None,
+      resource_fragment: None,
+      resource_query: None,
+      resource_path: Default::default(),
+      mimetype: None,
+      parameters: None,
+      encoding: None,
+      encoded_content: None,
+    });
+
+    run_loaders(
+      vec![Arc::new(Normal) as Arc<dyn Loader>, Arc::new(Normal2)],
+      rs,
+      Some(Arc::new(TestContentPlugin)),
+      (),
+      Arc::new(NativeFileSystem::new(false)),
+    )
+    .await
+    .unwrap();
+  }
+
+  #[tokio::test]
+  async fn should_override_data_if_finish_with_is_not_called() {
+    #[cacheable]
+    struct Normal;
+
+    impl Identifiable for Normal {
+      fn identifier(&self) -> Identifier {
+        "/rspack/normal-loader1".into()
+      }
+    }
+
+    #[cacheable_dyn]
+    #[async_trait::async_trait]
+    impl Loader<()> for Normal {
+      async fn run(&self, loader_context: &mut LoaderContext<()>) -> Result<()> {
+        assert!(loader_context.content.is_some());
+        // Does not call `LoaderContext::finish_with`
+        Ok(())
+      }
+    }
+
+    let rs = Arc::new(ResourceData {
+      scheme: OnceCell::new(),
+      resource: "/rspack/main.js?abc=123#efg".to_owned(),
+      resource_description: None,
+      resource_fragment: None,
+      resource_query: None,
+      resource_path: Default::default(),
+      mimetype: None,
+      parameters: None,
+      encoding: None,
+      encoded_content: None,
+    });
+
+    #[cacheable]
+    struct Normal2;
+
+    impl Identifiable for Normal2 {
+      fn identifier(&self) -> Identifier {
+        "/rspack/normal-loader2".into()
+      }
+    }
+
+    #[cacheable_dyn]
+    #[async_trait::async_trait]
+    impl Loader<()> for Normal2 {
+      async fn run(&self, loader_context: &mut LoaderContext<()>) -> Result<()> {
+        let (content, source_map, additional_data) = loader_context.take_all();
+        assert!(content.is_none());
+        assert!(source_map.is_none());
+        assert!(additional_data.is_none());
+        Ok(())
+      }
+    }
+
+    // Ignore error: Final loader didn't return a Buffer or String
+    assert!(run_loaders(
+      vec![Arc::new(Normal2), Arc::new(Normal)],
+      rs,
+      Some(Arc::new(TestContentPlugin)),
+      (),
+      Arc::new(NativeFileSystem::new(false))
+    )
+    .await
+    .err()
+    .is_some());
   }
 }

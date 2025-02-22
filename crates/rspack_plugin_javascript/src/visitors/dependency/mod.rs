@@ -1,93 +1,95 @@
-mod code_generation;
-mod common_js_scanner;
-mod harmony_detection;
-mod hmr_scanner;
-mod import_meta_scanner;
-mod node_stuff_scanner;
-mod scanner;
+mod context_dependency_helper;
+mod parser;
 mod util;
-pub use code_generation::*;
+
+use std::sync::Arc;
+
+use rspack_ast::javascript::Program;
 use rspack_core::{
-  ast::javascript::Program, BuildInfo, BuildMeta, CompilerOptions, Dependency, ModuleDependency,
-  ModuleType, ResourceData,
+  AdditionalData, AsyncDependenciesBlock, BoxDependency, BoxDependencyTemplate, BuildInfo,
+  ModuleLayer, ParserOptions,
 };
-use swc_core::common::{comments::Comments, Mark, SyntaxContext};
-pub use util::*;
+use rspack_core::{BuildMeta, CompilerOptions, ModuleIdentifier, ModuleType, ResourceData};
+use rspack_error::miette::Diagnostic;
+use rustc_hash::{FxHashMap, FxHashSet};
+use swc_core::common::Mark;
+use swc_core::common::{comments::Comments, BytePos, SourceFile, SourceMap};
+use swc_core::ecma::atoms::Atom;
 
-use self::{
-  common_js_scanner::CommonJsScanner, harmony_detection::HarmonyDetectionScanner,
-  hmr_scanner::HmrDependencyScanner, import_meta_scanner::ImportMetaScanner,
-  node_stuff_scanner::NodeStuffScanner, scanner::DependencyScanner,
+pub use self::context_dependency_helper::{create_context_dependency, ContextModuleScanResult};
+pub use self::parser::{
+  estree::*, AllowedMemberTypes, CallExpressionInfo, CallHooksName, ExportedVariableInfo,
+  JavascriptParser, MemberExpressionInfo, RootName, TagInfoData, TopLevelScope,
 };
+pub use self::util::*;
+use crate::BoxJavascriptParserPlugin;
 
-pub type ScanDependenciesResult = (Vec<Box<dyn ModuleDependency>>, Vec<Box<dyn Dependency>>);
+pub struct ScanDependenciesResult {
+  pub dependencies: Vec<BoxDependency>,
+  pub blocks: Vec<Box<AsyncDependenciesBlock>>,
+  pub presentational_dependencies: Vec<BoxDependencyTemplate>,
+  pub warning_diagnostics: Vec<Box<dyn Diagnostic + Send + Sync>>,
+}
 
+#[derive(Debug, Clone, Default)]
+pub enum ExtraSpanInfo {
+  #[default]
+  ReWriteUsedByExports,
+  // (symbol, usage)
+  // (local, exported) refer https://github.com/webpack/webpack/blob/ac7e531436b0d47cd88451f497cdfd0dad41535d/lib/javascript/JavascriptParser.js#L2347-L2352
+  AddVariableUsage(Vec<(Atom, Atom)>),
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn scan_dependencies(
+  source_map: Arc<SourceMap>,
+  source_file: &SourceFile,
   program: &Program,
-  unresolved_mark: Mark,
   resource_data: &ResourceData,
   compiler_options: &CompilerOptions,
   module_type: &ModuleType,
+  module_layer: Option<&ModuleLayer>,
   build_info: &mut BuildInfo,
   build_meta: &mut BuildMeta,
-) -> ScanDependenciesResult {
-  let mut dependencies: Vec<Box<dyn ModuleDependency>> = vec![];
-  let mut presentational_dependencies: Vec<Box<dyn Dependency>> = vec![];
-  let unresolved_ctxt = SyntaxContext::empty().apply_mark(unresolved_mark);
-  // Comments is wrapped by Arc/Rc
-  let comments = program.comments.clone();
-  program.visit_with_path(
-    &mut DependencyScanner::new(
-      &unresolved_ctxt,
-      resource_data,
-      compiler_options,
-      &mut dependencies,
-      &mut presentational_dependencies,
-      comments.as_ref().map(|c| c as &dyn Comments),
-    ),
-    &mut Default::default(),
+  module_identifier: ModuleIdentifier,
+  module_parser_options: Option<&ParserOptions>,
+  semicolons: &mut FxHashSet<BytePos>,
+  unresolved_mark: Mark,
+  parser_plugins: &mut Vec<BoxJavascriptParserPlugin>,
+  additional_data: Option<AdditionalData>,
+  parse_meta: FxHashMap<String, String>,
+) -> Result<ScanDependenciesResult, Vec<Box<dyn Diagnostic + Send + Sync>>> {
+  let mut parser = JavascriptParser::new(
+    source_map,
+    source_file,
+    compiler_options,
+    module_parser_options
+      .and_then(|p| p.get_javascript())
+      .expect("should at least have a global javascript parser options"),
+    program.comments.as_ref().map(|c| c as &dyn Comments),
+    &module_identifier,
+    module_type,
+    module_layer,
+    resource_data,
+    build_meta,
+    build_info,
+    semicolons,
+    unresolved_mark,
+    parser_plugins,
+    additional_data,
+    parse_meta,
   );
-  program.visit_with_path(
-    &mut HmrDependencyScanner::new(&mut dependencies),
-    &mut Default::default(),
-  );
 
-  if module_type.is_js_auto() || module_type.is_js_dynamic() {
-    program.visit_with_path(
-      &mut CommonJsScanner::new(&mut dependencies, &mut presentational_dependencies),
-      &mut Default::default(),
-    );
+  parser.walk_program(program.get_inner_program());
 
-    if let Some(node_option) = &compiler_options.node {
-      program.visit_with_path(
-        &mut NodeStuffScanner::new(
-          &mut presentational_dependencies,
-          &unresolved_ctxt,
-          compiler_options,
-          node_option,
-          resource_data,
-        ),
-        &mut Default::default(),
-      );
-    }
+  if parser.errors.is_empty() {
+    Ok(ScanDependenciesResult {
+      dependencies: parser.dependencies,
+      blocks: parser.blocks,
+      presentational_dependencies: parser.presentational_dependencies,
+      warning_diagnostics: parser.warning_diagnostics,
+    })
+  } else {
+    Err(parser.errors)
   }
-
-  if module_type.is_js_auto() || module_type.is_js_esm() {
-    program.visit_with_path(
-      &mut ImportMetaScanner::new(
-        &mut presentational_dependencies,
-        resource_data,
-        compiler_options,
-      ),
-      &mut Default::default(),
-    );
-    program.visit_with(&mut HarmonyDetectionScanner::new(
-      build_info,
-      build_meta,
-      module_type,
-      &mut presentational_dependencies,
-    ));
-  }
-
-  (dependencies, presentational_dependencies)
 }

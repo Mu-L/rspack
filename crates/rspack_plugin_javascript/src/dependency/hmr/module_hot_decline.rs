@@ -1,53 +1,56 @@
+use rspack_cacheable::{cacheable, cacheable_dyn, with::AsPreset};
 use rspack_core::{
-  create_javascript_visitor, CodeGeneratable, CodeGeneratableContext, CodeGeneratableResult,
-  Dependency, DependencyCategory, DependencyId, DependencyType, ErrorSpan, JsAstPath,
-  ModuleDependency,
+  module_id, AsContextDependency, Compilation, Dependency, DependencyCategory, DependencyId,
+  DependencyRange, DependencyTemplate, DependencyType, FactorizeInfo, ModuleDependency,
+  RuntimeSpec, TemplateContext, TemplateReplaceSource,
 };
-use swc_core::ecma::atoms::{Atom, JsWord};
+use swc_core::ecma::atoms::Atom;
 
+#[cacheable]
 #[derive(Debug, Clone)]
 pub struct ModuleHotDeclineDependency {
-  id: Option<DependencyId>,
-  request: JsWord,
-  // user_request: String,
-  category: &'static DependencyCategory,
-  dependency_type: &'static DependencyType,
-
-  span: Option<ErrorSpan>,
-  #[allow(unused)]
-  ast_path: JsAstPath,
+  id: DependencyId,
+  #[cacheable(with=AsPreset)]
+  request: Atom,
+  range: DependencyRange,
+  factorize_info: FactorizeInfo,
 }
 
 impl ModuleHotDeclineDependency {
-  pub fn new(request: JsWord, span: Option<ErrorSpan>, ast_path: JsAstPath) -> Self {
+  pub fn new(request: Atom, range: DependencyRange) -> Self {
     Self {
-      id: None,
+      id: DependencyId::new(),
       request,
-      category: &DependencyCategory::CommonJS,
-      dependency_type: &DependencyType::ModuleHotDecline,
-      span,
-      ast_path,
+      range,
+      factorize_info: Default::default(),
     }
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for ModuleHotDeclineDependency {
-  fn id(&self) -> Option<DependencyId> {
-    self.id
-  }
-  fn set_id(&mut self, id: Option<DependencyId>) {
-    self.id = id;
+  fn id(&self) -> &DependencyId {
+    &self.id
   }
 
   fn category(&self) -> &DependencyCategory {
-    self.category
+    &DependencyCategory::CommonJS
   }
 
   fn dependency_type(&self) -> &DependencyType {
-    self.dependency_type
+    &DependencyType::ModuleHotDecline
+  }
+
+  fn range(&self) -> Option<&DependencyRange> {
+    Some(&self.range)
+  }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::True
   }
 }
 
+#[cacheable_dyn]
 impl ModuleDependency for ModuleHotDeclineDependency {
   fn request(&self) -> &str {
     &self.request
@@ -57,35 +60,55 @@ impl ModuleDependency for ModuleHotDeclineDependency {
     &self.request
   }
 
-  fn span(&self) -> Option<&ErrorSpan> {
-    self.span.as_ref()
+  fn set_request(&mut self, request: String) {
+    self.request = request.into();
+  }
+
+  fn weak(&self) -> bool {
+    true
+  }
+
+  fn factorize_info(&self) -> &FactorizeInfo {
+    &self.factorize_info
+  }
+
+  fn factorize_info_mut(&mut self) -> &mut FactorizeInfo {
+    &mut self.factorize_info
   }
 }
 
-impl CodeGeneratable for ModuleHotDeclineDependency {
-  fn generate(
+#[cacheable_dyn]
+impl DependencyTemplate for ModuleHotDeclineDependency {
+  fn apply(
     &self,
-    code_generatable_context: &mut CodeGeneratableContext,
-  ) -> rspack_error::Result<CodeGeneratableResult> {
-    let CodeGeneratableContext { compilation, .. } = code_generatable_context;
+    source: &mut TemplateReplaceSource,
+    code_generatable_context: &mut TemplateContext,
+  ) {
+    source.replace(
+      self.range.start,
+      self.range.end,
+      module_id(
+        code_generatable_context.compilation,
+        &self.id,
+        &self.request,
+        self.weak(),
+      )
+      .as_str(),
+      None,
+    );
+  }
 
-    let mut code_gen = CodeGeneratableResult::default();
+  fn dependency_id(&self) -> Option<DependencyId> {
+    Some(self.id)
+  }
 
-    if let Some(id) = self.id() {
-      if let Some(module_id) = compilation
-        .module_graph
-        .module_graph_module_by_dependency_id(&id)
-        .map(|m| m.id(&compilation.chunk_graph).to_string())
-      {
-        code_gen.visitors.push(
-          create_javascript_visitor!(exact &self.ast_path, visit_mut_str(str: &mut Str) {
-            str.value = JsWord::from(&*module_id);
-            str.raw = Some(Atom::from(format!("\"{module_id}\"")));
-          }),
-        );
-      }
-    }
-
-    Ok(code_gen)
+  fn update_hash(
+    &self,
+    _hasher: &mut dyn std::hash::Hasher,
+    _compilation: &Compilation,
+    _runtime: Option<&RuntimeSpec>,
+  ) {
   }
 }
+
+impl AsContextDependency for ModuleHotDeclineDependency {}

@@ -1,79 +1,108 @@
-use std::path::PathBuf;
+use std::{fmt::Debug, sync::Arc};
 
-use rspack_error::{Result, TWithDiagnosticArray};
+use rspack_cacheable::{
+  cacheable,
+  with::{As, Skip},
+};
+use rspack_error::{Diagnostic, Result};
+use rspack_paths::ArcPath;
 use rustc_hash::FxHashSet as HashSet;
 
-use crate::{BoxModule, BoxModuleDependency, FactoryMeta, Resolve};
+use crate::{
+  cache::persistent::FromContext, BoxDependency, BoxModule, CompilationId, CompilerId,
+  CompilerOptions, Context, ModuleIdentifier, ModuleLayer, Resolve, ResolverFactory,
+};
 
-#[derive(Debug)]
+#[cacheable]
+#[derive(Debug, Clone)]
 pub struct ModuleFactoryCreateData {
-  pub resolve_options: Option<Resolve>,
-  pub context: Option<String>,
-  pub dependency: BoxModuleDependency,
+  pub compiler_id: CompilerId,
+  pub compilation_id: CompilationId,
+  pub resolve_options: Option<Arc<Resolve>>,
+  #[cacheable(with=As<FromContext>)]
+  pub options: Arc<CompilerOptions>,
+  pub context: Context,
+  pub dependencies: Vec<BoxDependency>,
+  pub issuer: Option<Box<str>>,
+  pub issuer_identifier: Option<ModuleIdentifier>,
+  pub issuer_layer: Option<ModuleLayer>,
+  pub resolver_factory: Arc<ResolverFactory>,
+
+  pub file_dependencies: HashSet<ArcPath>,
+  pub context_dependencies: HashSet<ArcPath>,
+  pub missing_dependencies: HashSet<ArcPath>,
+  #[cacheable(with=Skip)]
+  pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug)]
+impl ModuleFactoryCreateData {
+  pub fn request(&self) -> Option<&str> {
+    self.dependencies[0]
+      .as_module_dependency()
+      .map(|d| d.request())
+      .or_else(|| {
+        self.dependencies[0]
+          .as_context_dependency()
+          .map(|d| d.request())
+      })
+  }
+
+  pub fn add_file_dependency<F: Into<ArcPath>>(&mut self, file: F) {
+    self.file_dependencies.insert(file.into());
+  }
+
+  pub fn add_file_dependencies<F: Into<ArcPath>>(&mut self, files: impl IntoIterator<Item = F>) {
+    self
+      .file_dependencies
+      .extend(files.into_iter().map(Into::into));
+  }
+
+  pub fn add_context_dependency<F: Into<ArcPath>>(&mut self, context: F) {
+    self.context_dependencies.insert(context.into());
+  }
+
+  pub fn add_context_dependencies<F: Into<ArcPath>>(
+    &mut self,
+    contexts: impl IntoIterator<Item = F>,
+  ) {
+    self
+      .context_dependencies
+      .extend(contexts.into_iter().map(Into::into));
+  }
+
+  pub fn add_missing_dependency<F: Into<ArcPath>>(&mut self, missing: F) {
+    self.missing_dependencies.insert(missing.into());
+  }
+
+  pub fn add_missing_dependencies<F: Into<ArcPath>>(
+    &mut self,
+    missing: impl IntoIterator<Item = F>,
+  ) {
+    self
+      .missing_dependencies
+      .extend(missing.into_iter().map(Into::into));
+  }
+}
+
+#[derive(Debug, Default)]
 pub struct ModuleFactoryResult {
-  pub module: BoxModule,
-  pub file_dependencies: HashSet<PathBuf>,
-  pub context_dependencies: HashSet<PathBuf>,
-  pub missing_dependencies: HashSet<PathBuf>,
-  pub factory_meta: FactoryMeta,
+  pub module: Option<BoxModule>,
 }
 
 impl ModuleFactoryResult {
-  pub fn new(module: BoxModule) -> Self {
+  pub fn new_with_module(module: BoxModule) -> Self {
     Self {
-      module,
-      file_dependencies: Default::default(),
-      context_dependencies: Default::default(),
-      missing_dependencies: Default::default(),
-      factory_meta: Default::default(),
+      module: Some(module),
     }
   }
 
-  pub fn file_dependency(mut self, file: PathBuf) -> Self {
-    self.file_dependencies.insert(file);
-    self
-  }
-
-  pub fn file_dependencies(mut self, files: impl IntoIterator<Item = PathBuf>) -> Self {
-    self.file_dependencies.extend(files);
-    self
-  }
-
-  pub fn context_dependency(mut self, context: PathBuf) -> Self {
-    self.context_dependencies.insert(context);
-    self
-  }
-
-  pub fn context_dependencies(mut self, contexts: impl IntoIterator<Item = PathBuf>) -> Self {
-    self.context_dependencies.extend(contexts);
-    self
-  }
-
-  pub fn missing_dependency(mut self, missing: PathBuf) -> Self {
-    self.missing_dependencies.insert(missing);
-    self
-  }
-
-  pub fn missing_dependencies(mut self, missing: impl IntoIterator<Item = PathBuf>) -> Self {
-    self.missing_dependencies.extend(missing);
-    self
-  }
-
-  pub fn factory_meta(mut self, factory_meta: FactoryMeta) -> Self {
-    self.factory_meta = factory_meta;
+  pub fn module(mut self, module: Option<BoxModule>) -> Self {
+    self.module = module;
     self
   }
 }
 
 #[async_trait::async_trait]
-pub trait ModuleFactory {
-  async fn create(
-    mut self,
-    data: ModuleFactoryCreateData,
-  ) -> Result<TWithDiagnosticArray<ModuleFactoryResult>>;
+pub trait ModuleFactory: Debug + Sync + Send {
+  async fn create(&self, data: &mut ModuleFactoryCreateData) -> Result<ModuleFactoryResult>;
 }
-
-pub type BoxModuleFactory = Box<dyn ModuleFactory>;

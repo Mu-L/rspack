@@ -1,23 +1,23 @@
+use cow_utils::CowUtils;
+use rspack_collections::Identifier;
 use rspack_core::{
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  Compilation, RuntimeModule,
+  impl_runtime_module,
+  rspack_sources::{BoxSource, RawStringSource, SourceExt},
+  ChunkUkey, Compilation, RuntimeGlobals, RuntimeModule,
 };
-use rspack_identifier::Identifier;
 
-use crate::impl_runtime_module;
+use crate::get_chunk_runtime_requirements;
 
-#[derive(Debug, Default, Eq)]
+#[impl_runtime_module]
+#[derive(Debug)]
 pub struct EnsureChunkRuntimeModule {
   id: Identifier,
-  has_ensure_chunk_handlers: bool,
+  chunk: Option<ChunkUkey>,
 }
 
-impl EnsureChunkRuntimeModule {
-  pub fn new(has_ensure_chunk_handlers: bool) -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/ensure_chunk"),
-      has_ensure_chunk_handlers,
-    }
+impl Default for EnsureChunkRuntimeModule {
+  fn default() -> Self {
+    Self::with_default(Identifier::from("webpack/runtime/ensure_chunk"), None)
   }
 }
 
@@ -26,13 +26,30 @@ impl RuntimeModule for EnsureChunkRuntimeModule {
     self.id
   }
 
-  fn generate(&self, _compilation: &Compilation) -> BoxSource {
-    RawSource::from(match self.has_ensure_chunk_handlers {
-      true => include_str!("runtime/ensure_chunk.js"),
-      false => include_str!("runtime/ensure_chunk_with_inline.js"),
-    })
-    .boxed()
+  fn generate(&self, compilation: &Compilation) -> rspack_error::Result<BoxSource> {
+    let chunk_ukey = self.chunk.expect("should have chunk");
+    let runtime_requirements = get_chunk_runtime_requirements(compilation, &chunk_ukey);
+    Ok(
+      RawStringSource::from(
+        match runtime_requirements.contains(RuntimeGlobals::ENSURE_CHUNK_HANDLERS) {
+          true => include_str!("runtime/ensure_chunk.js")
+            .cow_replace(
+              "$FETCH_PRIORITY$",
+              if runtime_requirements.contains(RuntimeGlobals::HAS_FETCH_PRIORITY) {
+                ", fetchPriority"
+              } else {
+                ""
+              },
+            )
+            .into_owned(),
+          false => include_str!("runtime/ensure_chunk_with_inline.js").to_string(),
+        },
+      )
+      .boxed(),
+    )
+  }
+
+  fn attach(&mut self, chunk: ChunkUkey) {
+    self.chunk = Some(chunk);
   }
 }
-
-impl_runtime_module!(EnsureChunkRuntimeModule);

@@ -1,31 +1,26 @@
 use crate::{
-  Builtins, BundleEntries, CacheOptions, Context, DevServerOptions, Devtool, Experiments, Mode,
-  ModuleOptions, NodeOption, Optimization, OutputOptions, Resolve, SnapshotOptions, StatsOptions,
-  Target,
+  CacheOptions, Context, Experiments, Mode, ModuleOptions, NodeOption, Optimization, OutputOptions,
+  Resolve, StatsOptions,
 };
 
 #[derive(Debug)]
 pub struct CompilerOptions {
-  pub entry: BundleEntries,
+  pub name: Option<String>,
   pub context: Context,
-  pub dev_server: DevServerOptions,
   pub output: OutputOptions,
-  pub target: Target,
   pub mode: Mode,
   pub resolve: Resolve,
-  pub builtins: Builtins,
+  pub resolve_loader: Resolve,
   pub module: ModuleOptions,
-  pub devtool: Devtool,
   pub stats: StatsOptions,
-  pub snapshot: SnapshotOptions,
   pub cache: CacheOptions,
   pub experiments: Experiments,
   pub node: Option<NodeOption>,
   pub optimization: Optimization,
+  pub profile: bool,
+  pub amd: Option<String>,
+  pub bail: bool,
+  pub __references: References,
 }
 
-impl CompilerOptions {
-  pub fn is_incremental_rebuild(&self) -> bool {
-    self.experiments.incremental_rebuild && !matches!(self.cache, CacheOptions::Disabled)
-  }
-}
+pub type References = serde_json::Map<String, serde_json::Value>;

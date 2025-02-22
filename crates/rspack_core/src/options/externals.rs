@@ -1,25 +1,36 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use futures::future::BoxFuture;
 use rspack_error::Result;
 use rspack_regex::RspackRegex;
 use rustc_hash::FxHashMap as HashMap;
 
+use crate::{ResolveOptionsWithDependencyType, ResolverFactory};
+
 pub type Externals = Vec<ExternalItem>;
 
 #[derive(Debug)]
 pub enum ExternalItemValue {
   String(String),
+  Array(Vec<String>),
   Bool(bool),
-  Array(Vec<String>), // TODO: string[] | Record<string, string|string[]>
+  Object(HashMap<String, Vec<String>>),
 }
 
 pub type ExternalItemObject = HashMap<String, ExternalItemValue>;
+
+pub struct ContextInfo {
+  pub issuer: String,
+  pub issuer_layer: Option<String>,
+}
 
 pub struct ExternalItemFnCtx {
   pub request: String,
   pub context: String,
   pub dependency_type: String,
+  pub context_info: ContextInfo,
+  pub resolve_options_with_dependency_type: ResolveOptionsWithDependencyType,
+  pub resolver_factory: Arc<ResolverFactory>,
 }
 
 pub struct ExternalItemFnResult {
@@ -27,7 +38,7 @@ pub struct ExternalItemFnResult {
   pub result: Option<ExternalItemValue>,
 }
 
-pub type ExternalItemFn =
+type ExternalItemFn =
   Box<dyn Fn(ExternalItemFnCtx) -> BoxFuture<'static, Result<ExternalItemFnResult>> + Sync + Send>;
 
 pub enum ExternalItem {
@@ -35,6 +46,17 @@ pub enum ExternalItem {
   String(String),
   RegExp(RspackRegex),
   Fn(ExternalItemFn),
+}
+
+impl std::fmt::Debug for ExternalItem {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::Object(v) => f.debug_tuple("Object").field(v).finish(),
+      Self::String(v) => f.debug_tuple("String").field(v).finish(),
+      Self::RegExp(v) => f.debug_tuple("RegExp").field(v).finish(),
+      Self::Fn(_) => f.debug_tuple("Fn").field(&"...").finish(),
+    }
+  }
 }
 
 impl From<ExternalItemObject> for ExternalItem {

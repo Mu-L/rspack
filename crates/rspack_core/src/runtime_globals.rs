@@ -1,20 +1,15 @@
 use std::fmt;
 
 use bitflags::bitflags;
-use swc_core::ecma::atoms::JsWordStaticSet;
+use swc_core::ecma::atoms::Atom;
+
+#[rspack_cacheable::cacheable]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct RuntimeGlobals(u128);
 
 bitflags! {
-  pub struct RuntimeGlobals: u64 {
-
-    const INTEROP_REQUIRE = 1 << 0;
-
-    const EXPORT_STAR = 1 << 1;
-    /**
-     * rspack
-     * load chunk with module, let module code generation result can be cached at hmr
-     */
-    const LOAD_CHUNK_WITH_MODULE = 1 << 2;
-    // port from webpack RuntimeGlobals
+  impl RuntimeGlobals: u128 {
+    const REQUIRE_SCOPE = 1 << 0;
 
     /**
      * the internal module object
@@ -204,6 +199,64 @@ bitflags! {
     const ENSURE_CHUNK_INCLUDE_ENTRIES = 1 << 41;
 
     const STARTUP = 1 << 42;
+
+    const MAKE_NAMESPACE_OBJECT = 1 << 43;
+
+    const EXPORTS = 1 << 44;
+
+    const COMPAT_GET_DEFAULT_EXPORT = 1 << 45;
+
+    const CREATE_FAKE_NAMESPACE_OBJECT = 1 << 46;
+
+    const NODE_MODULE_DECORATOR = 1 << 47;
+
+    const ESM_MODULE_DECORATOR = 1 << 48;
+
+    /**
+     * the System.register context object
+     */
+    const SYSTEM_CONTEXT = 1 << 49;
+
+    const THIS_AS_EXPORTS = 1 << 50;
+
+    const CURRENT_REMOTE_GET_SCOPE = 1 << 51;
+
+    const SHARE_SCOPE_MAP = 1 << 52;
+
+    const INITIALIZE_SHARING = 1 << 53;
+
+    const SCRIPT_NONCE = 1 << 54;
+
+    const RELATIVE_URL = 1 << 55;
+
+    const CHUNK_NAME = 1 << 56;
+
+    const RUNTIME_ID = 1 << 57;
+
+    // prefetch and preload
+    const PREFETCH_CHUNK = 1 << 58;
+
+    const PREFETCH_CHUNK_HANDLERS = 1 << 59;
+
+    const PRELOAD_CHUNK = 1 << 60;
+
+    const PRELOAD_CHUNK_HANDLERS = 1 << 61;
+
+    const UNCAUGHT_ERROR_HANDLER = 1 << 62;
+
+    // rspack only
+    const RSPACK_VERSION = 1 << 63;
+
+    const HAS_CSS_MODULES = 1 << 64;
+
+    // rspack only
+    const RSPACK_UNIQUE_ID = 1 << 65;
+
+    const HAS_FETCH_PRIORITY = 1 << 66;
+
+    // amd module support
+    const AMD_DEFINE = 1 << 67;
+    const AMD_OPTIONS = 1 << 68;
   }
 }
 
@@ -221,18 +274,10 @@ impl Default for RuntimeGlobals {
 }
 
 impl RuntimeGlobals {
-  /// a self-mutating method of `union`, union any flags present in either self or other
-  /// It is used as a compatible function of HashSet's extend.
-  pub fn add(&mut self, other: RuntimeGlobals) {
-    *self |= other;
-  }
-
-  pub fn name(&self) -> &'static str {
+  pub const fn name(&self) -> &'static str {
     use RuntimeGlobals as R;
     match *self {
-      R::INTEROP_REQUIRE => "ir",
-      R::EXPORT_STAR => "es",
-      R::LOAD_CHUNK_WITH_MODULE => "__webpack_require__.el",
+      R::REQUIRE_SCOPE => "__webpack_require__.*",
       R::MODULE => "module",
       R::MODULE_ID => "module.id",
       R::MODULE_LOADED => "module.loaded",
@@ -257,6 +302,8 @@ impl RuntimeGlobals {
       R::GET_CHUNK_UPDATE_CSS_FILENAME => "__webpack_require__.hk",
       R::HMR_MODULE_DATA => "__webpack_require__.hmrD",
       R::HMR_RUNTIME_STATE_PREFIX => "__webpack_require__.hmrS",
+      R::AMD_DEFINE => "__webpack_require__.amdD",
+      R::AMD_OPTIONS => "__webpack_require__.amdO",
       R::EXTERNAL_INSTALL_CHUNK => "__webpack_require__.C",
       R::GET_FULL_HASH => "__webpack_require__.h",
       R::GLOBAL => "__webpack_require__.g",
@@ -273,30 +320,38 @@ impl RuntimeGlobals {
       R::STARTUP_NO_DEFAULT => "__webpack_require__.x (no default handler)",
       R::ENSURE_CHUNK_INCLUDE_ENTRIES => "__webpack_require__.f (include entries)",
       R::STARTUP => "__webpack_require__.x",
-      r => panic!(
-        "Unexpected flag `{r:?}`. RuntimeGlobals should only be printed for one single flag."
-      ),
-    }
-  }
+      R::MAKE_NAMESPACE_OBJECT => "__webpack_require__.r",
+      R::EXPORTS => "__webpack_exports__",
+      R::COMPAT_GET_DEFAULT_EXPORT => "__webpack_require__.n",
+      R::CREATE_FAKE_NAMESPACE_OBJECT => "__webpack_require__.t",
+      R::ESM_MODULE_DECORATOR => "__webpack_require__.hmd",
+      R::NODE_MODULE_DECORATOR => "__webpack_require__.nmd",
+      R::SYSTEM_CONTEXT => "__webpack_require__.y",
+      R::THIS_AS_EXPORTS => "top-level-this-exports",
+      R::CURRENT_REMOTE_GET_SCOPE => "__webpack_require__.R",
+      R::SHARE_SCOPE_MAP => "__webpack_require__.S",
+      R::INITIALIZE_SHARING => "__webpack_require__.I",
+      R::SCRIPT_NONCE => "__webpack_require__.nc",
+      R::RELATIVE_URL => "__webpack_require__.U",
+      R::CHUNK_NAME => "__webpack_require__.cn",
+      R::RUNTIME_ID => "__webpack_require__.j",
+      R::PREFETCH_CHUNK => "__webpack_require__.E",
+      R::PREFETCH_CHUNK_HANDLERS => "__webpack_require__.F",
+      R::PRELOAD_CHUNK => "__webpack_require__.G",
+      R::PRELOAD_CHUNK_HANDLERS => "__webpack_require__.H",
+      R::UNCAUGHT_ERROR_HANDLER => "__webpack_require__.oe",
+      // rspack only
+      R::RSPACK_VERSION => "__webpack_require__.rv",
+      R::RSPACK_UNIQUE_ID => "__webpack_require__.ruid",
+      R::HAS_CSS_MODULES => "has css modules",
 
-  /// A stub function for bitflags `iter` in 2.0.0, we are stuck to 1.3.0 now
-  pub fn iter(&self) -> impl Iterator<Item = Self> {
-    let mut bit = 0;
-    let bits = self.bits();
-    std::iter::from_fn(move || {
-      while bit < 64 {
-        let flag = 1 << bit;
-        bit += 1;
-        if bits & flag != 0 {
-          return Self::from_bits(flag);
-        }
-      }
-      None
-    })
+      R::HAS_FETCH_PRIORITY => "has fetch priority",
+      _ => unreachable!(),
+    }
   }
 }
 
-impl From<RuntimeGlobals> for string_cache::Atom<JsWordStaticSet> {
+impl From<RuntimeGlobals> for Atom {
   fn from(value: RuntimeGlobals) -> Self {
     value.name().into()
   }
@@ -321,15 +376,6 @@ mod test {
     assert_eq!(format!("{flags}"), "__webpack_require__.p");
     let flags = RuntimeGlobals::GET_CHUNK_CSS_FILENAME;
     assert_eq!(format!("{flags}"), "__webpack_require__.k");
-  }
-
-  #[test]
-  fn test_runtime_globals_operation() {
-    let mut runtime = RuntimeGlobals::default();
-    assert!(runtime.is_empty());
-    runtime.add(RuntimeGlobals::PUBLIC_PATH | RuntimeGlobals::GET_CHUNK_CSS_FILENAME);
-    assert!(!runtime.is_empty());
-    assert!(runtime.contains(RuntimeGlobals::PUBLIC_PATH));
   }
 
   #[test]

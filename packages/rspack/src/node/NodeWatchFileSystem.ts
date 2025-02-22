@@ -8,16 +8,22 @@
  * https://github.com/webpack/webpack/blob/main/LICENSE
  */
 
-import util from "util";
-import Watchpack, { WatchOptions } from "watchpack";
-import { FileSystemInfoEntry, Watcher, WatchFileSystem } from "../util/fs";
+import util from "node:util";
+import Watchpack from "watchpack";
+
+import type {
+	FileSystemInfoEntry,
+	InputFileSystem,
+	WatchFileSystem,
+	Watcher
+} from "../util/fs";
 
 export default class NodeWatchFileSystem implements WatchFileSystem {
-	inputFileSystem: any;
-	watcherOptions: WatchOptions;
+	inputFileSystem: InputFileSystem;
+	watcherOptions: Watchpack.WatchOptions;
 	watcher: Watchpack;
 
-	constructor(inputFileSystem: any) {
+	constructor(inputFileSystem: InputFileSystem) {
 		this.inputFileSystem = inputFileSystem;
 		this.watcherOptions = {
 			aggregateTimeout: 0
@@ -30,9 +36,9 @@ export default class NodeWatchFileSystem implements WatchFileSystem {
 		directories: Iterable<string>,
 		missing: Iterable<string>,
 		startTime: number,
-		options: WatchOptions,
+		options: Watchpack.WatchOptions,
 		callback: (
-			error: Error,
+			error: Error | null,
 			fileTimeInfoEntries: Map<string, FileSystemInfoEntry | "ignore">,
 			contextTimeInfoEntries: Map<string, FileSystemInfoEntry | "ignore">,
 			changedFiles: Set<string>,
@@ -83,19 +89,18 @@ export default class NodeWatchFileSystem implements WatchFileSystem {
 			// pause emitting events (avoids clearing aggregated changes and removals on timeout)
 			this.watcher.pause();
 
-			if (this.inputFileSystem && this.inputFileSystem.purge) {
+			if (this.inputFileSystem?.purge) {
 				const fs = this.inputFileSystem;
 				for (const item of changes) {
-					fs.purge(item);
+					fs.purge?.(item);
 				}
 				for (const item of removals) {
-					fs.purge(item);
+					fs.purge?.(item);
 				}
 			}
 			const { fileTimeInfoEntries, contextTimeInfoEntries } = fetchTimeInfo();
 
 			callback(
-				// @ts-expect-error
 				null,
 				fileTimeInfoEntries,
 				contextTimeInfoEntries,
@@ -113,8 +118,7 @@ export default class NodeWatchFileSystem implements WatchFileSystem {
 			close: () => {
 				if (this.watcher) {
 					this.watcher.close();
-					// @ts-expect-error
-					this.watcher = null;
+					this.watcher = null as any;
 				}
 			},
 			pause: () => {
@@ -124,11 +128,11 @@ export default class NodeWatchFileSystem implements WatchFileSystem {
 			},
 			getAggregatedRemovals: util.deprecate(
 				() => {
-					const items = this.watcher && this.watcher.aggregatedRemovals;
-					if (items && this.inputFileSystem && this.inputFileSystem.purge) {
+					const items = this.watcher?.aggregatedRemovals;
+					if (items && this.inputFileSystem?.purge) {
 						const fs = this.inputFileSystem;
 						for (const item of items) {
-							fs.purge(item);
+							fs.purge?.(item);
 						}
 					}
 					return items;
@@ -138,11 +142,11 @@ export default class NodeWatchFileSystem implements WatchFileSystem {
 			),
 			getAggregatedChanges: util.deprecate(
 				() => {
-					const items = this.watcher && this.watcher.aggregatedChanges;
-					if (items && this.inputFileSystem && this.inputFileSystem.purge) {
+					const items = this.watcher?.aggregatedChanges;
+					if (items && this.inputFileSystem?.purge) {
 						const fs = this.inputFileSystem;
 						for (const item of items) {
-							fs.purge(item);
+							fs.purge?.(item);
 						}
 					}
 					return items;
@@ -165,18 +169,18 @@ export default class NodeWatchFileSystem implements WatchFileSystem {
 				"DEP_WEBPACK_WATCHER_CONTEXT_TIME_INFO_ENTRIES"
 			),
 			getInfo: () => {
-				const removals = this.watcher && this.watcher.aggregatedRemovals;
-				const changes = this.watcher && this.watcher.aggregatedChanges;
-				if (this.inputFileSystem && this.inputFileSystem.purge) {
+				const removals = this.watcher?.aggregatedRemovals;
+				const changes = this.watcher?.aggregatedChanges;
+				if (this.inputFileSystem?.purge) {
 					const fs = this.inputFileSystem;
 					if (removals) {
 						for (const item of removals) {
-							fs.purge(item);
+							fs.purge?.(item);
 						}
 					}
 					if (changes) {
 						for (const item of changes) {
-							fs.purge(item);
+							fs.purge?.(item);
 						}
 					}
 				}

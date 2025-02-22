@@ -1,90 +1,644 @@
-use std::borrow::Cow;
 use std::collections::hash_map::Entry;
-use std::path::PathBuf;
 
-use rspack_error::{internal_error, Result};
-use rspack_identifier::IdentifierMap;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-
-mod connection;
-pub use connection::{ConnectionId, ModuleGraphConnection};
+use rspack_collections::{IdentifierMap, UkeyMap};
+use rspack_error::Result;
+use rspack_hash::RspackHashDigest;
+use rustc_hash::FxHashMap as HashMap;
+use swc_core::ecma::atoms::Atom;
 
 use crate::{
-  BoxModule, BoxModuleDependency, BuildDependency, BuildInfo, BuildMeta, DependencyId, Module,
-  ModuleGraphModule, ModuleIdentifier,
+  AsyncDependenciesBlock, AsyncDependenciesBlockIdentifier, Compilation, Dependency,
+  ExportProvided, ProvidedExports, RuntimeSpec, UsedExports,
+};
+mod module;
+pub use module::*;
+mod connection;
+pub use connection::*;
+
+use crate::{
+  BoxDependency, BoxModule, DependencyCondition, DependencyId, ExportInfo, ExportInfoData,
+  ExportsInfo, ExportsInfoData, ModuleIdentifier,
 };
 
-#[derive(Debug, Default)]
-pub struct ModuleGraph {
-  dependency_id_to_module_identifier: HashMap<DependencyId, ModuleIdentifier>,
+// TODO Here request can be used Atom
+pub type ImportVarMap =
+  HashMap<Option<ModuleIdentifier> /* request */, String /* import_var */>;
 
-  /// Module identifier to its module
-  module_identifier_to_module: IdentifierMap<BoxModule>,
+pub type BuildDependency = (
+  DependencyId,
+  Option<ModuleIdentifier>, /* parent module */
+);
 
-  /// Module identifier to its module graph module
-  module_identifier_to_module_graph_module: IdentifierMap<ModuleGraphModule>,
-
-  dependency_id_to_connection_id: HashMap<DependencyId, ConnectionId>,
-  connection_id_to_dependency_id: HashMap<ConnectionId, DependencyId>,
-
-  /// Dependencies indexed by `DependencyId`
-  /// None means the dependency has been removed
-  dependencies: Vec<Option<BoxModuleDependency>>,
-
-  /// Dependencies indexed by `ConnectionId`
-  /// None means the connection has been removed
-  connections: Vec<Option<ModuleGraphConnection>>,
-
-  /// Module graph connections table index for `ConnectionId`
-  connections_map: HashMap<ModuleGraphConnection, ConnectionId>,
+/// https://github.com/webpack/webpack/blob/ac7e531436b0d47cd88451f497cdfd0dad41535d/lib/ModuleGraph.js#L742-L748
+#[derive(Debug)]
+pub struct DependencyExtraMeta {
+  pub ids: Vec<Atom>,
+  pub explanation: Option<&'static str>,
 }
 
-impl ModuleGraph {
+#[derive(Debug, Default, Clone)]
+pub struct DependencyParents {
+  pub block: Option<AsyncDependenciesBlockIdentifier>,
+  pub module: ModuleIdentifier,
+  pub index_in_block: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct ModuleGraphPartial {
+  /// Module indexed by `ModuleIdentifier`.
+  pub(crate) modules: IdentifierMap<Option<BoxModule>>,
+
+  /// Dependencies indexed by `DependencyId`.
+  dependencies: HashMap<DependencyId, Option<BoxDependency>>,
+
+  /// AsyncDependenciesBlocks indexed by `AsyncDependenciesBlockIdentifier`.
+  blocks: HashMap<AsyncDependenciesBlockIdentifier, Option<Box<AsyncDependenciesBlock>>>,
+
+  /// ModuleGraphModule indexed by `ModuleIdentifier`.
+  module_graph_modules: IdentifierMap<Option<ModuleGraphModule>>,
+
+  /// ModuleGraphConnection indexed by `DependencyId`.
+  connections: HashMap<DependencyId, Option<ModuleGraphConnection>>,
+
+  /// Dependency_id to parent module identifier and parent block
+  ///
+  /// # Example
+  ///
+  /// ```ignore
+  /// let parent_module_id = parent_module.identifier();
+  /// parent_module
+  ///   .get_dependencies()
+  ///   .iter()
+  ///   .map(|dependency_id| {
+  ///     let parents_info = module_graph_partial
+  ///       .dependency_id_to_parents
+  ///       .get(dependency_id)
+  ///       .unwrap()
+  ///       .unwrap();
+  ///     assert_eq!(parents_info, parent_module_id);
+  ///   })
+  /// ```
+  dependency_id_to_parents: HashMap<DependencyId, Option<DependencyParents>>,
+
+  // Module's ExportsInfo is also a part of ModuleGraph
+  exports_info_map: UkeyMap<ExportsInfo, ExportsInfoData>,
+  export_info_map: UkeyMap<ExportInfo, ExportInfoData>,
+  connection_to_condition: HashMap<DependencyId, DependencyCondition>,
+  dep_meta_map: HashMap<DependencyId, DependencyExtraMeta>,
+}
+
+#[derive(Debug, Default)]
+pub struct ModuleGraph<'a> {
+  partials: Vec<&'a ModuleGraphPartial>,
+  active: Option<&'a mut ModuleGraphPartial>,
+}
+
+impl<'a> ModuleGraph<'a> {
+  pub fn new(
+    partials: Vec<&'a ModuleGraphPartial>,
+    active: Option<&'a mut ModuleGraphPartial>,
+  ) -> Self {
+    Self { partials, active }
+  }
+
+  fn loop_partials<T>(&self, f: impl Fn(&ModuleGraphPartial) -> Option<&T>) -> Option<&T> {
+    if let Some(active) = &self.active
+      && let Some(r) = f(active)
+    {
+      return Some(r);
+    }
+
+    for item in self.partials.iter().rev() {
+      if let Some(r) = f(item) {
+        return Some(r);
+      }
+    }
+    None
+  }
+
+  fn loop_partials_mut<REF, MUT>(
+    &mut self,
+    f_exist: impl Fn(&ModuleGraphPartial) -> bool,
+    f_set: impl Fn(&mut ModuleGraphPartial, REF),
+    f: impl Fn(&ModuleGraphPartial) -> Option<REF>,
+    f_mut: impl Fn(&mut ModuleGraphPartial) -> Option<&mut MUT>,
+  ) -> Option<&mut MUT> {
+    let Some(active_partial) = &mut self.active else {
+      panic!("should have active partial");
+    };
+
+    let active_exist = f_exist(active_partial);
+    if !active_exist {
+      let mut search_result = None;
+      for item in self.partials.iter().rev() {
+        if let Some(r) = f(item) {
+          search_result = Some(r);
+          break;
+        }
+      }
+      if let Some(search_result) = search_result {
+        f_set(active_partial, search_result);
+      }
+    }
+
+    f_mut(active_partial)
+  }
+
   /// Return an unordered iterator of modules
-  pub fn modules(&self) -> &IdentifierMap<BoxModule> {
-    &self.module_identifier_to_module
+  pub fn modules(&self) -> IdentifierMap<&BoxModule> {
+    let mut res = IdentifierMap::default();
+    for item in self.partials.iter() {
+      for (k, v) in &item.modules {
+        if let Some(v) = v {
+          res.insert(*k, v);
+        } else {
+          res.remove(k);
+        }
+      }
+    }
+    if let Some(active) = &self.active {
+      for (k, v) in &active.modules {
+        if let Some(v) = v {
+          res.insert(*k, v);
+        } else {
+          res.remove(k);
+        }
+      }
+    }
+    res
   }
 
-  pub fn modules_mut(&mut self) -> &mut IdentifierMap<BoxModule> {
-    &mut self.module_identifier_to_module
+  pub fn module_graph_modules(&self) -> IdentifierMap<&ModuleGraphModule> {
+    let mut res = IdentifierMap::default();
+    for item in self.partials.iter() {
+      for (k, v) in &item.module_graph_modules {
+        if let Some(v) = v {
+          res.insert(*k, v);
+        } else {
+          res.remove(k);
+        }
+      }
+    }
+    if let Some(active) = &self.active {
+      for (k, v) in &active.module_graph_modules {
+        if let Some(v) = v {
+          res.insert(*k, v);
+        } else {
+          res.remove(k);
+        }
+      }
+    }
+    res
   }
 
-  pub fn module_graph_modules(&self) -> &IdentifierMap<ModuleGraphModule> {
-    &self.module_identifier_to_module_graph_module
+  // #[tracing::instrument(skip_all, fields(module = ?module_id))]
+  pub fn get_incoming_connections_by_origin_module(
+    &self,
+    module_id: &ModuleIdentifier,
+  ) -> HashMap<Option<ModuleIdentifier>, Vec<ModuleGraphConnection>> {
+    let connections = self
+      .module_graph_module_by_identifier(module_id)
+      .expect("should have mgm")
+      .incoming_connections();
+
+    let mut map: HashMap<Option<ModuleIdentifier>, Vec<ModuleGraphConnection>> = HashMap::default();
+    for dep_id in connections {
+      let con = self
+        .connection_by_dependency_id(dep_id)
+        .expect("should have connection");
+      match map.entry(con.original_module_identifier) {
+        Entry::Occupied(mut occ) => {
+          occ.get_mut().push(con.clone());
+        }
+        Entry::Vacant(vac) => {
+          vac.insert(vec![con.clone()]);
+        }
+      }
+    }
+    map
+  }
+
+  /// Remove dependency in mgm and target connection, return dependency_id and origin module identifier
+  ///
+  /// force will completely remove dependency, and you will not regenerate it from dependency_id
+  pub fn revoke_dependency(
+    &mut self,
+    dep_id: &DependencyId,
+    force: bool,
+  ) -> Option<BuildDependency> {
+    let original_module_identifier = self.get_parent_module(dep_id).copied();
+    let module_identifier = self.module_identifier_by_dependency_id(dep_id).copied();
+
+    let Some(active_partial) = &mut self.active else {
+      panic!("should have active partial");
+    };
+    if module_identifier.is_some() {
+      active_partial.connections.insert(*dep_id, None);
+    }
+    if force {
+      active_partial.dependencies.insert(*dep_id, None);
+      active_partial
+        .dependency_id_to_parents
+        .insert(*dep_id, None);
+    }
+
+    // remove outgoing from original module graph module
+    if let Some(original_module_identifier) = &original_module_identifier {
+      if let Some(mgm) = self.module_graph_module_by_identifier_mut(original_module_identifier) {
+        mgm.remove_outgoing_connection(dep_id);
+        // Because of mgm.all_dependencies is set when original module build success
+        // it does not need to remove dependency in mgm.all_dependencies.
+      }
+    }
+    // remove incoming from module graph module
+    if let Some(module_identifier) = &module_identifier {
+      if let Some(mgm) = self.module_graph_module_by_identifier_mut(module_identifier) {
+        mgm.remove_incoming_connection(dep_id);
+      }
+    }
+
+    Some((*dep_id, original_module_identifier))
+  }
+
+  pub fn revoke_module(&mut self, module_id: &ModuleIdentifier) -> Vec<BuildDependency> {
+    let blocks = self
+      .module_by_identifier(module_id)
+      .map(|m| Vec::from(m.get_blocks()))
+      .unwrap_or_default();
+
+    let (incoming_connections, all_dependencies) = self
+      .module_graph_module_by_identifier(module_id)
+      .map(|mgm| {
+        (
+          mgm.incoming_connections().clone(),
+          mgm.all_dependencies.clone(),
+        )
+      })
+      .unwrap_or_default();
+
+    let Some(active_partial) = &mut self.active else {
+      panic!("should have active partial");
+    };
+
+    active_partial.modules.insert(*module_id, None);
+    active_partial.module_graph_modules.insert(*module_id, None);
+
+    for block in blocks {
+      active_partial.blocks.insert(block, None);
+    }
+
+    for dep_id in all_dependencies {
+      self.revoke_dependency(&dep_id, true);
+    }
+
+    incoming_connections
+      .iter()
+      .filter_map(|dep_id| self.revoke_dependency(dep_id, false))
+      .collect()
   }
 
   pub fn add_module_graph_module(&mut self, module_graph_module: ModuleGraphModule) {
-    if let Entry::Vacant(val) = self
-      .module_identifier_to_module_graph_module
+    let Some(active_partial) = &mut self.active else {
+      panic!("should have active partial");
+    };
+    match active_partial
+      .module_graph_modules
       .entry(module_graph_module.module_identifier)
     {
-      val.insert(module_graph_module);
+      Entry::Occupied(mut val) => {
+        if val.get().is_none() {
+          val.insert(Some(module_graph_module));
+        }
+      }
+      Entry::Vacant(val) => {
+        val.insert(Some(module_graph_module));
+      }
     }
+  }
+
+  /// Make sure both source and target module are exists in module graph
+  pub fn clone_module_attributes(
+    compilation: &mut Compilation,
+    source_module: &ModuleIdentifier,
+    target_module: &ModuleIdentifier,
+  ) {
+    let mut module_graph = compilation.get_module_graph_mut();
+    let old_mgm = module_graph
+      .module_graph_module_by_identifier(source_module)
+      .expect("should have mgm");
+
+    // Using this tuple to avoid violating rustc borrow rules
+    let assign_tuple = (
+      old_mgm.post_order_index,
+      old_mgm.pre_order_index,
+      old_mgm.depth,
+      old_mgm.exports,
+    );
+    let new_mgm = module_graph
+      .module_graph_module_by_identifier_mut(target_module)
+      .expect("should have mgm");
+    new_mgm.post_order_index = assign_tuple.0;
+    new_mgm.pre_order_index = assign_tuple.1;
+    new_mgm.depth = assign_tuple.2;
+    new_mgm.exports = assign_tuple.3;
+
+    let is_async = ModuleGraph::is_async(compilation, source_module);
+    ModuleGraph::set_async(compilation, *target_module, is_async);
+  }
+
+  pub fn move_module_connections(
+    &mut self,
+    old_module: &ModuleIdentifier,
+    new_module: &ModuleIdentifier,
+    filter_connection: impl Fn(&ModuleGraphConnection, &Box<dyn Dependency>) -> bool,
+  ) {
+    if old_module == new_module {
+      return;
+    }
+
+    // Outgoing connections
+    let outgoing_connections = self
+      .module_graph_module_by_identifier(old_module)
+      .expect("should have mgm")
+      .outgoing_connections()
+      .clone();
+    let mut affected_outgoing_connection = vec![];
+    for dep_id in outgoing_connections {
+      let connection = self
+        .connection_by_dependency_id(&dep_id)
+        .expect("should have connection");
+      let dependency = self
+        .dependency_by_id(&dep_id)
+        .expect("should have dependency");
+      if filter_connection(connection, dependency) {
+        let connection = self
+          .connection_by_dependency_id_mut(&dep_id)
+          .expect("should have connection");
+        connection.original_module_identifier = Some(*new_module);
+        affected_outgoing_connection.push(dep_id);
+      }
+    }
+
+    let old_mgm = self
+      .module_graph_module_by_identifier_mut(old_module)
+      .expect("should have mgm");
+    for dep_id in &affected_outgoing_connection {
+      old_mgm.remove_outgoing_connection(dep_id);
+    }
+
+    let new_mgm = self
+      .module_graph_module_by_identifier_mut(new_module)
+      .expect("should have mgm");
+    for dep_id in affected_outgoing_connection {
+      new_mgm.add_outgoing_connection(dep_id);
+    }
+
+    // Incoming connections
+    let incoming_connections = self
+      .module_graph_module_by_identifier(old_module)
+      .expect("should have mgm")
+      .incoming_connections()
+      .clone();
+    let mut affected_incoming_connection = vec![];
+    for dep_id in incoming_connections {
+      let connection = self
+        .connection_by_dependency_id(&dep_id)
+        .expect("should have connection");
+      let dependency = self
+        .dependency_by_id(&dep_id)
+        .expect("should have dependency");
+      // the inactive connection should not be updated
+      if filter_connection(connection, dependency) && (connection.conditional || connection.active)
+      {
+        let connection = self
+          .connection_by_dependency_id_mut(&dep_id)
+          .expect("should have connection");
+        connection.set_module_identifier(*new_module);
+        affected_incoming_connection.push(dep_id);
+      }
+    }
+
+    let old_mgm = self
+      .module_graph_module_by_identifier_mut(old_module)
+      .expect("should have mgm");
+    for dep_id in &affected_incoming_connection {
+      old_mgm.remove_incoming_connection(dep_id);
+    }
+
+    let new_mgm = self
+      .module_graph_module_by_identifier_mut(new_module)
+      .expect("should have mgm");
+    for dep_id in affected_incoming_connection {
+      new_mgm.add_incoming_connection(dep_id);
+    }
+  }
+
+  pub fn copy_outgoing_module_connections<F>(
+    &mut self,
+    old_module: &ModuleIdentifier,
+    new_module: &ModuleIdentifier,
+    filter_connection: F,
+  ) where
+    F: Fn(&ModuleGraphConnection, &BoxDependency) -> bool,
+  {
+    if old_module == new_module {
+      return;
+    }
+
+    let old_mgm_connections = self
+      .module_graph_module_by_identifier(old_module)
+      .expect("should have mgm")
+      .outgoing_connections()
+      .clone();
+
+    // Outgoing connections
+    let mut affected_outgoing_connections = vec![];
+    for dep_id in old_mgm_connections {
+      let connection = self
+        .connection_by_dependency_id(&dep_id)
+        .expect("should have connection");
+      let dep = self
+        .dependency_by_id(&dep_id)
+        .expect("should have dependency");
+      if filter_connection(connection, dep) {
+        let con = self
+          .connection_by_dependency_id_mut(&dep_id)
+          .expect("should have connection");
+        con.original_module_identifier = Some(*new_module);
+        affected_outgoing_connections.push(dep_id);
+      }
+    }
+
+    let new_mgm = self
+      .module_graph_module_by_identifier_mut(new_module)
+      .expect("should have mgm");
+    for dep_id in affected_outgoing_connections {
+      new_mgm.add_outgoing_connection(dep_id);
+    }
+  }
+
+  pub fn get_depth(&self, module_id: &ModuleIdentifier) -> Option<usize> {
+    self
+      .module_graph_module_by_identifier(module_id)
+      .and_then(|mgm| mgm.depth)
+  }
+
+  pub fn set_depth(&mut self, module_id: ModuleIdentifier, depth: usize) {
+    let mgm = self
+      .module_graph_module_by_identifier_mut(&module_id)
+      .expect("should have module graph module");
+    mgm.depth = Some(depth);
+  }
+
+  pub fn set_depth_if_lower(&mut self, module_id: &ModuleIdentifier, depth: usize) -> bool {
+    let mgm = self
+      .module_graph_module_by_identifier_mut(module_id)
+      .expect("should have module graph module");
+    if let Some(ref mut cur_depth) = mgm.depth {
+      if *cur_depth > depth {
+        *cur_depth = depth;
+        return true;
+      }
+    } else {
+      mgm.depth = Some(depth);
+      return true;
+    }
+    false
   }
 
   pub fn add_module(&mut self, module: BoxModule) {
-    if let Entry::Vacant(val) = self.module_identifier_to_module.entry(module.identifier()) {
-      val.insert(module);
+    let Some(active_partial) = &mut self.active else {
+      panic!("should have active partial");
+    };
+    match active_partial.modules.entry(module.identifier()) {
+      Entry::Occupied(mut val) => {
+        if val.get().is_none() {
+          val.insert(Some(module));
+        }
+      }
+      Entry::Vacant(val) => {
+        val.insert(Some(module));
+      }
     }
   }
 
-  pub fn add_dependency(&mut self, mut dependency: BoxModuleDependency) -> DependencyId {
-    if let Some(dependency_id) = dependency.id() {
-      return dependency_id;
+  pub fn add_block(&mut self, block: Box<AsyncDependenciesBlock>) {
+    let Some(active_partial) = &mut self.active else {
+      panic!("should have active partial");
+    };
+    active_partial
+      .blocks
+      .insert(block.identifier(), Some(block));
+  }
+
+  pub fn set_parents(&mut self, dependency_id: DependencyId, parents: DependencyParents) {
+    let Some(active_partial) = &mut self.active else {
+      panic!("should have active partial");
+    };
+    active_partial
+      .dependency_id_to_parents
+      .insert(dependency_id, Some(parents));
+  }
+
+  pub fn get_parent_module(&self, dependency_id: &DependencyId) -> Option<&ModuleIdentifier> {
+    self
+      .loop_partials(|p| p.dependency_id_to_parents.get(dependency_id))?
+      .as_ref()
+      .map(|p| &p.module)
+  }
+
+  pub fn get_parent_block(
+    &self,
+    dependency_id: &DependencyId,
+  ) -> Option<&AsyncDependenciesBlockIdentifier> {
+    self
+      .loop_partials(|p| p.dependency_id_to_parents.get(dependency_id))?
+      .as_ref()
+      .map(|p| &p.block)?
+      .as_ref()
+  }
+
+  pub fn get_parent_block_index(&self, dependency_id: &DependencyId) -> Option<usize> {
+    self
+      .loop_partials(|p| p.dependency_id_to_parents.get(dependency_id))?
+      .as_ref()
+      .map(|p| p.index_in_block)
+  }
+
+  pub fn block_by_id(
+    &self,
+    block_id: &AsyncDependenciesBlockIdentifier,
+  ) -> Option<&AsyncDependenciesBlock> {
+    self
+      .loop_partials(|p| p.blocks.get(block_id))?
+      .as_ref()
+      .map(|b| &**b)
+  }
+
+  pub fn block_by_id_mut(
+    &mut self,
+    block_id: &AsyncDependenciesBlockIdentifier,
+  ) -> Option<&mut Box<AsyncDependenciesBlock>> {
+    self
+      .loop_partials_mut(
+        |p| p.blocks.contains_key(block_id),
+        |p, search_result| {
+          p.blocks.insert(*block_id, search_result);
+        },
+        |p| p.blocks.get(block_id).cloned(),
+        |p| p.blocks.get_mut(block_id),
+      )?
+      .as_mut()
+  }
+
+  pub fn block_by_id_expect(
+    &self,
+    block_id: &AsyncDependenciesBlockIdentifier,
+  ) -> &AsyncDependenciesBlock {
+    self
+      .loop_partials(|p| p.blocks.get(block_id))
+      .expect("should insert block before get it")
+      .as_ref()
+      .expect("block has been removed to None")
+  }
+
+  pub fn dependencies(&self) -> HashMap<DependencyId, &BoxDependency> {
+    let mut res = HashMap::default();
+    for item in self.partials.iter() {
+      for (k, v) in &item.dependencies {
+        if let Some(v) = v {
+          res.insert(*k, v);
+        } else {
+          res.remove(k);
+        }
+      }
     }
-    let new_dependency_id = self.dependencies.len();
-    let new_dependency_id = DependencyId::from(new_dependency_id);
-    dependency.set_id(Some(new_dependency_id));
-    self.dependencies.push(Some(dependency));
-    new_dependency_id
+    if let Some(active) = &self.active {
+      for (k, v) in &active.dependencies {
+        if let Some(v) = v {
+          res.insert(*k, v);
+        } else {
+          res.remove(k);
+        }
+      }
+    }
+
+    res
   }
 
-  pub fn dependency_by_id(&self, dependency_id: &DependencyId) -> Option<&BoxModuleDependency> {
-    self.dependencies[**dependency_id].as_ref()
+  pub fn add_dependency(&mut self, dependency: BoxDependency) {
+    let Some(active_partial) = &mut self.active else {
+      panic!("should have active partial");
+    };
+    active_partial
+      .dependencies
+      .insert(*dependency.id(), Some(dependency));
   }
 
-  fn remove_dependency(&mut self, dependency_id: &DependencyId) {
-    self.dependencies[**dependency_id] = None;
+  pub fn dependency_by_id(&self, dependency_id: &DependencyId) -> Option<&BoxDependency> {
+    self
+      .loop_partials(|p| p.dependencies.get(dependency_id))?
+      .as_ref()
   }
 
   /// Uniquely identify a module by its dependency
@@ -94,15 +648,77 @@ impl ModuleGraph {
   ) -> Option<&ModuleGraphModule> {
     self
       .module_identifier_by_dependency_id(id)
-      .and_then(|module_identifier| {
-        self
-          .module_identifier_to_module_graph_module
-          .get(module_identifier)
-      })
+      .and_then(|module_identifier| self.module_graph_module_by_identifier(module_identifier))
   }
 
-  pub fn module_identifier_by_dependency_id(&self, id: &DependencyId) -> Option<&ModuleIdentifier> {
-    self.dependency_id_to_module_identifier.get(id)
+  pub fn module_identifier_by_dependency_id(
+    &self,
+    dep_id: &DependencyId,
+  ) -> Option<&ModuleIdentifier> {
+    self
+      .loop_partials(|p| p.connections.get(dep_id))?
+      .as_ref()
+      .map(|con| con.module_identifier())
+  }
+
+  pub fn get_module_by_dependency_id(&self, dep_id: &DependencyId) -> Option<&BoxModule> {
+    if let Some(module_id) = self.module_identifier_by_dependency_id(dep_id) {
+      self.loop_partials(|p| p.modules.get(module_id))?.as_ref()
+    } else {
+      None
+    }
+  }
+
+  fn add_connection(
+    &mut self,
+    connection: ModuleGraphConnection,
+    condition: Option<DependencyCondition>,
+  ) {
+    if self
+      .connection_by_dependency_id(&connection.dependency_id)
+      .is_some()
+    {
+      return;
+    }
+
+    let Some(active_partial) = &mut self.active else {
+      panic!("should have active partial");
+    };
+
+    if let Some(condition) = condition {
+      active_partial
+        .connection_to_condition
+        .insert(connection.dependency_id, condition);
+    }
+
+    let module_id = *connection.module_identifier();
+    let origin_module_id = connection.original_module_identifier;
+    let dependency_id = connection.dependency_id;
+
+    // add to connections list
+    active_partial
+      .connections
+      .insert(connection.dependency_id, Some(connection));
+
+    // set to module incoming connection
+    {
+      let mgm = self
+        .module_graph_module_by_identifier_mut(&module_id)
+        .unwrap_or_else(|| {
+          panic!(
+            "Failed to add connection: Module linked to module identifier {module_id} cannot be found"
+          )
+        });
+
+      mgm.add_incoming_connection(dependency_id);
+    }
+
+    // set to origin module outgoing connection
+    if let Some(identifier) = origin_module_id
+      && let Some(original_mgm) = self.module_graph_module_by_identifier_mut(&identifier)
+    {
+      original_mgm.add_outgoing_connection(dependency_id);
+    };
   }
 
   /// Add a connection between two module graph modules, if a connection exists, then it will be reused.
@@ -112,542 +728,405 @@ impl ModuleGraph {
     dependency_id: DependencyId,
     module_identifier: ModuleIdentifier,
   ) -> Result<()> {
-    self
-      .dependency_id_to_module_identifier
-      .insert(dependency_id, module_identifier);
-
-    let new_connection =
-      ModuleGraphConnection::new(original_module_identifier, dependency_id, module_identifier);
-
-    let connection_id = if let Some(connection_id) = self.connections_map.get(&new_connection) {
-      *connection_id
-    } else {
-      let new_connection_id = ConnectionId::from(self.connections.len());
-      self.connections.push(Some(new_connection));
-      self
-        .connections_map
-        .insert(new_connection, new_connection_id);
-      new_connection_id
-    };
-
-    self
-      .dependency_id_to_connection_id
-      .insert(dependency_id, connection_id);
-
-    self
-      .connection_id_to_dependency_id
-      .insert(connection_id, dependency_id);
-
-    {
-      let mgm = self
-        .module_graph_module_by_identifier_mut(&module_identifier)
-        .ok_or_else(|| {
-          internal_error!(
-            "Failed to set resolved module: Module linked to module identifier {module_identifier} cannot be found"
-          )
-        })?;
-
-      mgm.add_incoming_connection(connection_id);
+    let dependency = self
+      .dependency_by_id(&dependency_id)
+      .expect("should have dependency");
+    let is_module_dependency =
+      dependency.as_module_dependency().is_some() || dependency.as_context_dependency().is_some();
+    let condition = dependency
+      .as_module_dependency()
+      .and_then(|dep| dep.get_condition());
+    if !is_module_dependency {
+      return Ok(());
     }
 
-    if let Some(identifier) = original_module_identifier && let Some(original_mgm) = self.
-    module_graph_module_by_identifier_mut(&identifier) {
-        original_mgm.add_outgoing_connection(connection_id);
-    };
+    let active = !matches!(condition, Some(DependencyCondition::False));
+    let conditional = condition.is_some();
+    let new_connection = ModuleGraphConnection::new(
+      dependency_id,
+      original_module_identifier,
+      module_identifier,
+      active,
+      conditional,
+    );
+    self.add_connection(new_connection, condition);
 
     Ok(())
   }
 
   /// Uniquely identify a module by its identifier and return the aliased reference
-  #[inline]
   pub fn module_by_identifier(&self, identifier: &ModuleIdentifier) -> Option<&BoxModule> {
-    self.module_identifier_to_module.get(identifier)
+    self.loop_partials(|p| p.modules.get(identifier))?.as_ref()
   }
 
-  /// Aggregate function which combine `get_normal_module_by_identifier`, `as_normal_module`, `get_resource_resolved_data`
-  #[inline]
-  pub fn normal_module_source_path_by_identifier(
-    &self,
-    identifier: &ModuleIdentifier,
-  ) -> Option<Cow<str>> {
-    self
-      .module_identifier_to_module
-      .get(identifier)
-      .and_then(|module| module.as_normal_module())
-      .map(|module| {
-        module
-          .resource_resolved_data()
-          .resource_path
-          .to_string_lossy()
-      })
-  }
-
-  /// Uniquely identify a module by its identifier and return the exclusive reference
-  #[inline]
   pub fn module_by_identifier_mut(
     &mut self,
     identifier: &ModuleIdentifier,
   ) -> Option<&mut BoxModule> {
-    self.module_identifier_to_module.get_mut(identifier)
+    let Some(active_partial) = &mut self.active else {
+      panic!("should have active partial");
+    };
+    if let Some(res) = active_partial.modules.get_mut(identifier) {
+      res.as_mut()
+    } else {
+      None
+    }
   }
 
   /// Uniquely identify a module graph module by its module's identifier and return the aliased reference
-  #[inline]
   pub fn module_graph_module_by_identifier(
     &self,
     identifier: &ModuleIdentifier,
   ) -> Option<&ModuleGraphModule> {
     self
-      .module_identifier_to_module_graph_module
-      .get(identifier)
+      .loop_partials(|p| p.module_graph_modules.get(identifier))?
+      .as_ref()
   }
 
   /// Uniquely identify a module graph module by its module's identifier and return the exclusive reference
-  #[inline]
   pub fn module_graph_module_by_identifier_mut(
     &mut self,
     identifier: &ModuleIdentifier,
   ) -> Option<&mut ModuleGraphModule> {
     self
-      .module_identifier_to_module_graph_module
-      .get_mut(identifier)
+      .loop_partials_mut(
+        |p| p.module_graph_modules.contains_key(identifier),
+        |p, search_result| {
+          p.module_graph_modules.insert(*identifier, search_result);
+        },
+        |p| p.module_graph_modules.get(identifier).cloned(),
+        |p| p.module_graph_modules.get_mut(identifier),
+      )?
+      .as_mut()
   }
 
-  /// Uniquely identify a connection by a given dependency
-  pub fn connection_by_dependency(
-    &self,
-    dependency_id: &DependencyId,
-  ) -> Option<&ModuleGraphConnection> {
-    self
-      .dependency_id_to_connection_id
-      .get(dependency_id)
-      .and_then(|connection_id| self.connection_by_connection_id(connection_id))
+  /// refer https://github.com/webpack/webpack/blob/ac7e531436b0d47cd88451f497cdfd0dad41535d/lib/ModuleGraph.js#L582-L585
+  pub fn get_export_info(&mut self, module_id: ModuleIdentifier, export_name: &Atom) -> ExportInfo {
+    let exports_info = self.get_exports_info(&module_id);
+    exports_info.get_export_info(self, export_name)
   }
 
-  /// Get a list of all dependencies of a module by the module itself, if the module is not found, then None is returned
-  pub fn dependencies_by_module(&self, module: &dyn Module) -> Option<&[DependencyId]> {
-    self.dependencies_by_module_identifier(&module.identifier())
-  }
-
-  /// Get a list of all dependencies of a module by the module identifier, if the module is not found, then None is returned
-  pub fn dependencies_by_module_identifier(
+  pub(crate) fn get_ordered_outgoing_connections(
     &self,
     module_identifier: &ModuleIdentifier,
-  ) -> Option<&[DependencyId]> {
+  ) -> impl Iterator<Item = &DependencyId> {
     self
       .module_graph_module_by_identifier(module_identifier)
-      .map(|mgm| mgm.dependencies.as_slice())
+      .map(|m| {
+        m.all_dependencies
+          .iter()
+          .filter(|dep_id| self.connection_by_dependency_id(dep_id).is_some())
+      })
+      .into_iter()
+      .flatten()
   }
 
-  pub fn dependency_by_connection_id(
-    &self,
-    connection_id: &ConnectionId,
-  ) -> Option<&BoxModuleDependency> {
-    self
-      .connection_id_to_dependency_id
-      .get(connection_id)
-      .and_then(|dependency_id| self.dependency_by_id(dependency_id))
-  }
-
-  pub fn parent_module_by_dependency_id(
+  pub fn connection_by_dependency_id(
     &self,
     dependency_id: &DependencyId,
-  ) -> Option<ModuleIdentifier> {
-    self
-      .connection_by_dependency(dependency_id)
-      .and_then(|c| c.original_module_identifier)
-  }
-
-  pub fn connection_by_connection_id(
-    &self,
-    connection_id: &ConnectionId,
   ) -> Option<&ModuleGraphConnection> {
-    self.connections[**connection_id].as_ref()
+    self
+      .loop_partials(|p| p.connections.get(dependency_id))?
+      .as_ref()
   }
 
-  pub fn remove_connection_by_dependency(
+  pub fn connection_by_dependency_id_mut(
     &mut self,
     dependency_id: &DependencyId,
-  ) -> Option<ModuleGraphConnection> {
-    let mut removed = None;
-
-    if let Some(connection_id) = self.dependency_id_to_connection_id.remove(dependency_id) {
-      self.connection_id_to_dependency_id.remove(&connection_id);
-
-      if let Some(connection) = self.connections[*connection_id].take() {
-        self.connections_map.remove(&connection);
-
-        if let Some(mgm) = connection
-          .original_module_identifier
-          .as_ref()
-          .and_then(|ident| self.module_graph_module_by_identifier_mut(ident))
-        {
-          mgm.outgoing_connections.remove(&connection_id);
-        };
-
-        if let Some(mgm) = self.module_graph_module_by_identifier_mut(&connection.module_identifier)
-        {
-          mgm.incoming_connections.remove(&connection_id);
-        }
-
-        removed = Some(connection);
-      }
-    }
+  ) -> Option<&mut ModuleGraphConnection> {
     self
-      .dependency_id_to_module_identifier
-      .remove(dependency_id);
-    self.remove_dependency(dependency_id);
-
-    removed
+      .loop_partials_mut(
+        |p| p.connections.contains_key(dependency_id),
+        |p, search_result| {
+          p.connections.insert(*dependency_id, search_result);
+        },
+        |p| p.connections.get(dependency_id).cloned(),
+        |p| p.connections.get_mut(dependency_id),
+      )?
+      .as_mut()
   }
 
-  pub fn get_pre_order_index(&self, module_identifier: &ModuleIdentifier) -> Option<usize> {
+  pub fn get_pre_order_index(&self, module_id: &ModuleIdentifier) -> Option<u32> {
     self
-      .module_graph_module_by_identifier(module_identifier)
+      .module_graph_module_by_identifier(module_id)
       .and_then(|mgm| mgm.pre_order_index)
   }
 
-  pub fn get_issuer(&self, module: &BoxModule) -> Option<&BoxModule> {
+  pub fn get_post_order_index(&self, module_id: &ModuleIdentifier) -> Option<u32> {
     self
-      .module_graph_module_by_identifier(&module.identifier())
-      .and_then(|mgm| mgm.get_issuer().get_module(self))
+      .module_graph_module_by_identifier(module_id)
+      .and_then(|mgm| mgm.post_order_index)
   }
 
-  pub fn is_async(&self, module: &ModuleIdentifier) -> bool {
+  pub fn get_issuer(&self, module_id: &ModuleIdentifier) -> Option<&BoxModule> {
     self
-      .module_graph_module_by_identifier(module)
-      .map(|mgm| {
-        mgm
-          .build_meta
-          .as_ref()
-          .expect("build_meta should be initialized")
-          .is_async
-      })
-      .unwrap_or_default()
+      .module_graph_module_by_identifier(module_id)
+      .and_then(|mgm| mgm.issuer().get_module(self))
   }
 
-  pub fn set_async(&mut self, module: &ModuleIdentifier) {
-    if let Some(mgm) = self.module_graph_module_by_identifier_mut(module) {
-      mgm
-        .build_meta
-        .as_mut()
-        .expect("build_meta should be initialized")
-        .is_async = true;
-    }
-  }
-
-  pub fn get_outgoing_connections(&self, module: &BoxModule) -> HashSet<&ModuleGraphConnection> {
-    self
-      .module_graph_module_by_identifier(&module.identifier())
-      .map(|mgm| {
-        mgm
-          .outgoing_connections
-          .iter()
-          .filter_map(|id| self.connection_by_connection_id(id))
-          .collect()
-      })
-      .unwrap_or_default()
-  }
-
-  /// Remove a connection and return connection origin module identifier and dependency
-  fn revoke_connection(&mut self, connection_id: ConnectionId) -> Option<BuildDependency> {
-    let connection = match self.connections[*connection_id].take() {
-      Some(c) => c,
-      None => return None,
-    };
-    self.connections_map.remove(&connection);
-
-    let ModuleGraphConnection {
-      original_module_identifier,
-      module_identifier,
-      dependency_id,
-      ..
-    } = connection;
-
-    // remove dependency
-    self.dependency_id_to_connection_id.remove(&dependency_id);
-    self
-      .dependency_id_to_module_identifier
-      .remove(&dependency_id);
-
-    // remove outgoing from original module graph module
-    if let Some(original_module_identifier) = &original_module_identifier {
-      if let Some(mgm) = self
-        .module_identifier_to_module_graph_module
-        .get_mut(original_module_identifier)
-      {
-        mgm.outgoing_connections.remove(&connection_id);
-        // Because of mgm.dependencies is set when original module build success
-        // it does not need to remove dependency in mgm.dependencies.
+  pub fn is_optional(&self, module_id: &ModuleIdentifier) -> bool {
+    let mut has_connections = false;
+    for connection in self.get_incoming_connections(module_id) {
+      let Some(dependency) = self
+        .dependency_by_id(&connection.dependency_id)
+        .and_then(|dep| dep.as_module_dependency())
+      else {
+        return false;
+      };
+      if !dependency.get_optional() || !connection.is_target_active(self, None) {
+        return false;
       }
+      has_connections = true;
     }
-    // remove incoming from module graph module
-    if let Some(mgm) = self
-      .module_identifier_to_module_graph_module
-      .get_mut(&module_identifier)
-    {
-      mgm.incoming_connections.remove(&connection_id);
-    }
-
-    Some((dependency_id, original_module_identifier))
+    has_connections
   }
 
-  /// Remove module from module graph and return parent module identifier and dependency pair
-  pub fn revoke_module(&mut self, module_identifier: &ModuleIdentifier) -> Vec<BuildDependency> {
-    self.module_identifier_to_module.remove(module_identifier);
-    let mgm = self
-      .module_identifier_to_module_graph_module
-      .remove(module_identifier);
-
-    if let Some(mgm) = mgm {
-      for cid in mgm.outgoing_connections {
-        self.revoke_connection(cid);
-      }
-
-      mgm
-        .incoming_connections
-        .iter()
-        .filter_map(|cid| self.revoke_connection(*cid))
-        .collect()
-    } else {
-      vec![]
-    }
+  pub fn is_async(compilation: &Compilation, module_id: &ModuleIdentifier) -> bool {
+    compilation.async_modules_artifact.contains(module_id)
   }
 
-  pub fn set_module_build_info_and_meta(
-    &mut self,
-    module_identifier: &ModuleIdentifier,
-    build_info: BuildInfo,
-    build_meta: BuildMeta,
-  ) {
-    if let Some(mgm) = self.module_graph_module_by_identifier_mut(module_identifier) {
-      mgm.build_info = Some(build_info);
-      mgm.build_meta = Some(build_meta);
-    }
-  }
-
-  #[inline]
-  pub fn get_module_hash(&self, module_identifier: &ModuleIdentifier) -> Option<u64> {
-    self
-      .module_graph_module_by_identifier(module_identifier)
-      .and_then(|mgm| mgm.build_info.as_ref().map(|i| i.hash))
-  }
-
-  pub fn has_dependencies(
-    &self,
-    module_identifier: &ModuleIdentifier,
-    files: &HashSet<PathBuf>,
+  pub fn set_async(
+    compilation: &mut Compilation,
+    module_id: ModuleIdentifier,
+    is_async: bool,
   ) -> bool {
-    if let Some(build_info) = self
+    let original = Self::is_async(compilation, &module_id);
+    if original == is_async {
+      return false;
+    }
+    if original {
+      compilation.async_modules_artifact.remove(&module_id)
+    } else {
+      compilation.async_modules_artifact.insert(module_id)
+    }
+  }
+
+  pub fn get_outgoing_connections(
+    &self,
+    module_id: &ModuleIdentifier,
+  ) -> impl Iterator<Item = &ModuleGraphConnection> + Clone {
+    self
+      .module_graph_module_by_identifier(module_id)
+      .map(|mgm| {
+        mgm
+          .outgoing_connections()
+          .iter()
+          .filter_map(|id| self.connection_by_dependency_id(id))
+      })
+      .into_iter()
+      .flatten()
+  }
+
+  pub fn get_incoming_connections(
+    &self,
+    module_id: &ModuleIdentifier,
+  ) -> impl Iterator<Item = &ModuleGraphConnection> + Clone {
+    self
+      .module_graph_module_by_identifier(module_id)
+      .map(|mgm| {
+        mgm
+          .incoming_connections()
+          .iter()
+          .filter_map(|id| self.connection_by_dependency_id(id))
+      })
+      .into_iter()
+      .flatten()
+  }
+
+  pub fn get_module_hash(&self, module_id: &ModuleIdentifier) -> Option<&RspackHashDigest> {
+    self
+      .module_by_identifier(module_id)
+      .and_then(|m| m.build_info().hash.as_ref())
+  }
+
+  /// We can't insert all sort of things into one hashmap like javascript, so we create different
+  /// hashmap to store different kinds of meta.
+  pub fn get_dep_meta_if_existing(&self, id: &DependencyId) -> Option<&DependencyExtraMeta> {
+    self.loop_partials(|p| p.dep_meta_map.get(id))
+  }
+
+  pub fn set_dependency_extra_meta(&mut self, dep_id: DependencyId, extra: DependencyExtraMeta) {
+    let Some(active_partial) = &mut self.active else {
+      panic!("should have active partial");
+    };
+    active_partial.dep_meta_map.insert(dep_id, extra);
+  }
+
+  pub fn can_update_module(&self, dep_id: &DependencyId, module_id: &ModuleIdentifier) -> bool {
+    let connection = self
+      .connection_by_dependency_id(dep_id)
+      .expect("should have connection");
+    connection.module_identifier() != module_id
+  }
+
+  pub fn do_update_module(&mut self, dep_id: &DependencyId, module_id: &ModuleIdentifier) {
+    let connection = self
+      .connection_by_dependency_id_mut(dep_id)
+      .unwrap_or_else(|| panic!("{dep_id:?}"));
+    let old_module_identifier = *connection.module_identifier();
+    connection.set_module_identifier(*module_id);
+
+    // remove dep_id from old module mgm incoming connection
+    let old_mgm = self
+      .module_graph_module_by_identifier_mut(&old_module_identifier)
+      .expect("should exist mgm");
+    old_mgm.remove_incoming_connection(dep_id);
+
+    // add dep_id to updated module mgm incoming connection
+    let new_mgm = self
+      .module_graph_module_by_identifier_mut(module_id)
+      .expect("should exist mgm");
+    new_mgm.add_incoming_connection(*dep_id);
+  }
+
+  pub fn get_exports_info(&self, module_identifier: &ModuleIdentifier) -> ExportsInfo {
+    let mgm = self
       .module_graph_module_by_identifier(module_identifier)
-      .and_then(|mgm| mgm.build_info.as_ref())
-    {
-      for item in files {
-        if build_info.file_dependencies.contains(item)
-          || build_info.build_dependencies.contains(item)
-          || build_info.context_dependencies.contains(item)
-          || build_info.missing_dependencies.contains(item)
-        {
-          return true;
-        }
+      .expect("should have mgm");
+    self
+      .loop_partials(|p| p.exports_info_map.get(&mgm.exports))
+      .expect("should have exports info")
+      .id()
+  }
+
+  pub fn get_exports_info_by_id(&self, id: &ExportsInfo) -> &ExportsInfoData {
+    self
+      .try_get_exports_info_by_id(id)
+      .expect("should have exports info")
+  }
+
+  pub fn try_get_exports_info_by_id(&self, id: &ExportsInfo) -> Option<&ExportsInfoData> {
+    self.loop_partials(|p| p.exports_info_map.get(id))
+  }
+
+  pub fn get_exports_info_mut_by_id(&mut self, id: &ExportsInfo) -> &mut ExportsInfoData {
+    self
+      .loop_partials_mut(
+        |p| p.exports_info_map.contains_key(id),
+        |p, search_result| {
+          p.exports_info_map.insert(*id, search_result);
+        },
+        |p| p.exports_info_map.get(id).cloned(),
+        |p| p.exports_info_map.get_mut(id),
+      )
+      .expect("should have exports info")
+  }
+
+  pub fn set_exports_info(&mut self, id: ExportsInfo, info: ExportsInfoData) {
+    let Some(active_partial) = &mut self.active else {
+      panic!("should have active partial");
+    };
+    active_partial.exports_info_map.insert(id, info);
+  }
+
+  pub fn try_get_export_info_by_id(&self, id: &ExportInfo) -> Option<&ExportInfoData> {
+    self.loop_partials(|p| p.export_info_map.get(id))
+  }
+
+  pub fn get_export_info_by_id(&self, id: &ExportInfo) -> &ExportInfoData {
+    self
+      .try_get_export_info_by_id(id)
+      .expect("should have export info")
+  }
+
+  pub fn get_export_info_mut_by_id(&mut self, id: &ExportInfo) -> &mut ExportInfoData {
+    self
+      .loop_partials_mut(
+        |p| p.export_info_map.contains_key(id),
+        |p, search_result| {
+          p.export_info_map.insert(*id, search_result);
+        },
+        |p| p.export_info_map.get(id).cloned(),
+        |p| p.export_info_map.get_mut(id),
+      )
+      .expect("should have export info")
+  }
+
+  pub fn set_export_info(&mut self, id: ExportInfo, info: ExportInfoData) {
+    let Some(active_partial) = &mut self.active else {
+      panic!("should have active partial");
+    };
+    active_partial.export_info_map.insert(id, info);
+  }
+
+  pub fn get_provided_exports(&self, module_id: ModuleIdentifier) -> ProvidedExports {
+    let mgm = self
+      .module_graph_module_by_identifier(&module_id)
+      .expect("should have module graph module");
+    mgm.exports.get_provided_exports(self)
+  }
+
+  pub fn get_used_exports(
+    &self,
+    id: &ModuleIdentifier,
+    runtime: Option<&RuntimeSpec>,
+  ) -> UsedExports {
+    let mgm = self
+      .module_graph_module_by_identifier(id)
+      .expect("should have module graph module");
+    mgm.exports.get_used_exports(self, runtime)
+  }
+
+  pub fn get_optimization_bailout_mut(&mut self, id: &ModuleIdentifier) -> &mut Vec<String> {
+    let mgm = self
+      .module_graph_module_by_identifier_mut(id)
+      .expect("should have module graph module");
+    mgm.optimization_bailout_mut()
+  }
+
+  pub fn get_read_only_export_info(&self, id: &ModuleIdentifier, name: Atom) -> Option<ExportInfo> {
+    self
+      .module_graph_module_by_identifier(id)
+      .map(|mgm| mgm.exports.get_read_only_export_info(self, &name))
+  }
+
+  pub fn get_condition_state(
+    &self,
+    connection: &ModuleGraphConnection,
+    runtime: Option<&RuntimeSpec>,
+  ) -> ConnectionState {
+    let condition = self
+      .loop_partials(|p| p.connection_to_condition.get(&connection.dependency_id))
+      .expect("should have condition");
+    match condition {
+      DependencyCondition::False => ConnectionState::Bool(false),
+      DependencyCondition::Fn(f) => f.get_connection_state(connection, runtime, self),
+    }
+  }
+
+  // returns: Option<bool>
+  //   - None: it's unknown
+  //   - Some(true): provided
+  //   - Some(false): not provided
+  pub fn is_export_provided(&self, id: &ModuleIdentifier, names: &[Atom]) -> Option<bool> {
+    self.module_graph_module_by_identifier(id).and_then(|mgm| {
+      match mgm.exports.is_export_provided(self, names)? {
+        ExportProvided::True => Some(true),
+        ExportProvided::False => Some(false),
+        ExportProvided::Null => None,
       }
+    })
+  }
+
+  // todo remove it after module_graph_partial remove all of dependency_id_to_*
+  pub fn cache_recovery_connection(&mut self, connection: ModuleGraphConnection) {
+    let condition = self
+      .dependency_by_id(&connection.dependency_id)
+      .and_then(|d| d.as_module_dependency())
+      .and_then(|dep| dep.get_condition());
+    let Some(active_partial) = &mut self.active else {
+      panic!("should have active partial");
+    };
+
+    // recovery condition
+    if let Some(condition) = condition {
+      active_partial
+        .connection_to_condition
+        .insert(connection.dependency_id, condition);
     }
 
-    false
-  }
-}
-
-#[cfg(test)]
-mod test {
-  use std::borrow::Cow;
-
-  use rspack_error::{Result, TWithDiagnosticArray};
-  use rspack_identifier::Identifiable;
-  use rspack_sources::Source;
-
-  use crate::{
-    BuildContext, BuildResult, CodeGeneratable, CodeGenerationResult, Compilation, Context,
-    Dependency, DependencyId, Module, ModuleDependency, ModuleGraph, ModuleGraphModule,
-    ModuleIdentifier, ModuleType, SourceType,
-  };
-
-  // Define a detailed node type for `ModuleGraphModule`s
-  #[derive(Debug, PartialEq, Eq, Hash)]
-  struct Node(&'static str);
-
-  macro_rules! impl_noop_trait_module_type {
-    ($ident:ident) => {
-      impl Identifiable for $ident {
-        fn identifier(&self) -> ModuleIdentifier {
-          (stringify!($ident).to_owned() + "__" + self.0).into()
-        }
-      }
-
-      #[::async_trait::async_trait]
-      impl Module for $ident {
-        fn module_type(&self) -> &ModuleType {
-          unreachable!()
-        }
-
-        fn source_types(&self) -> &[SourceType] {
-          unreachable!()
-        }
-
-        fn original_source(&self) -> Option<&dyn Source> {
-          unreachable!()
-        }
-
-        fn size(&self, _source_type: &SourceType) -> f64 {
-          unreachable!()
-        }
-
-        fn readable_identifier(&self, _context: &Context) -> Cow<str> {
-          unreachable!()
-        }
-
-        async fn build(
-          &mut self,
-          _build_context: BuildContext<'_>,
-        ) -> Result<TWithDiagnosticArray<BuildResult>> {
-          unreachable!()
-        }
-
-        fn code_generation(&self, _compilation: &Compilation) -> Result<CodeGenerationResult> {
-          unreachable!()
-        }
-      }
-    };
-  }
-
-  impl_noop_trait_module_type!(Node);
-
-  // Define a detailed edge type for `ModuleGraphConnection`s, tuple contains the parent module identifier and the child module specifier
-  #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-  struct Edge(Option<ModuleIdentifier>, String);
-
-  macro_rules! impl_noop_trait_dep_type {
-    ($ident:ident) => {
-      impl Dependency for $ident {}
-
-      impl ModuleDependency for $ident {
-        fn request(&self) -> &str {
-          &*self.1
-        }
-
-        fn user_request(&self) -> &str {
-          &*self.1
-        }
-
-        fn span(&self) -> Option<&crate::ErrorSpan> {
-          unreachable!()
-        }
-      }
-
-      impl CodeGeneratable for $ident {
-        fn generate(
-          &self,
-          _code_generatable_context: &mut crate::CodeGeneratableContext,
-        ) -> Result<crate::CodeGeneratableResult> {
-          unreachable!()
-        }
-      }
-    };
-  }
-
-  impl_noop_trait_dep_type!(Edge);
-
-  fn add_module_to_graph(mg: &mut ModuleGraph, m: Box<dyn Module>) {
-    let mgm = ModuleGraphModule::new(m.identifier(), ModuleType::Js);
-    mg.add_module_graph_module(mgm);
-    mg.add_module(m);
-  }
-
-  fn link_modules_with_dependency(
-    mg: &mut ModuleGraph,
-    from: Option<&ModuleIdentifier>,
-    to: &ModuleIdentifier,
-    dep: Box<dyn ModuleDependency>,
-  ) -> DependencyId {
-    let dependency_id = mg.add_dependency(dep);
-    mg.dependency_id_to_module_identifier
-      .insert(dependency_id, *to);
-    if let Some(p_id) = from && let Some(mgm) = mg.module_graph_module_by_identifier_mut(p_id) {
-      mgm.dependencies.push(dependency_id);
-    }
-    mg.set_resolved_module(from.copied(), dependency_id, *to)
-      .expect("failed to set resolved module");
-
-    assert_eq!(
-      mg.dependency_id_to_module_identifier
-        .get(&dependency_id)
-        .copied(),
-      Some(*to)
-    );
-    dependency_id
-  }
-
-  fn mgm<'m>(mg: &'m ModuleGraph, m_id: &ModuleIdentifier) -> &'m ModuleGraphModule {
-    mg.module_graph_module_by_identifier(m_id)
-      .expect("not found")
-  }
-
-  macro_rules! node {
-    ($s:literal) => {
-      Node($s)
-    };
-  }
-
-  macro_rules! edge {
-    ($from:literal, $to:expr) => {
-      Edge(Some($from.into()), $to.into())
-    };
-    ($from:expr, $to:expr) => {
-      Edge($from, $to.into())
-    };
-  }
-
-  #[test]
-  fn test_module_graph() {
-    let mut mg = ModuleGraph::default();
-    let a = node!("a");
-    let b = node!("b");
-    let a_id = a.identifier();
-    let b_id = b.identifier();
-    let a_to_b = edge!(Some(a_id), b_id.as_str());
-    add_module_to_graph(&mut mg, Box::new(a));
-    add_module_to_graph(&mut mg, Box::new(b));
-    let a_to_b_id = link_modules_with_dependency(&mut mg, Some(&a_id), &b_id, Box::new(a_to_b));
-
-    let mgm_a = mgm(&mg, &a_id);
-    let mgm_b = mgm(&mg, &b_id);
-    let conn_a = mgm_a.outgoing_connections.iter().collect::<Vec<_>>();
-    let conn_b = mgm_b.incoming_connections.iter().collect::<Vec<_>>();
-    assert_eq!(conn_a[0], conn_b[0]);
-
-    let c = node!("c");
-    let c_id = c.identifier();
-    let b_to_c = edge!(Some(b_id), c_id.as_str());
-    add_module_to_graph(&mut mg, Box::new(c));
-    let b_to_c_id = link_modules_with_dependency(&mut mg, Some(&b_id), &c_id, Box::new(b_to_c));
-
-    let mgm_b = mgm(&mg, &b_id);
-    let mgm_c = mgm(&mg, &c_id);
-    let conn_b = mgm_b.outgoing_connections.iter().collect::<Vec<_>>();
-    let conn_c = mgm_c.incoming_connections.iter().collect::<Vec<_>>();
-    assert_eq!(conn_c[0], conn_b[0]);
-
-    mg.remove_connection_by_dependency(&a_to_b_id);
-
-    let mgm_a = mgm(&mg, &a_id);
-    let mgm_b = mgm(&mg, &b_id);
-    assert!(mgm_a.outgoing_connections.is_empty());
-    assert!(mgm_b.incoming_connections.is_empty());
-
-    mg.remove_connection_by_dependency(&b_to_c_id);
-
-    let mgm_b = mgm(&mg, &b_id);
-    let mgm_c = mgm(&mg, &c_id);
-    assert!(mgm_b.outgoing_connections.is_empty());
-    assert!(mgm_c.incoming_connections.is_empty());
+    active_partial
+      .connections
+      .insert(connection.dependency_id, Some(connection));
   }
 }

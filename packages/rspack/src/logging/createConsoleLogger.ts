@@ -8,44 +8,37 @@
  * https://github.com/webpack/webpack/blob/main/LICENSE
  */
 
-// @ts-nocheck
+import type { FilterItemTypes, FilterTypes } from "../config";
+import { LogType, type LogTypeEnum } from "./Logger";
 
-const { LogType } = require("./Logger");
+export type FilterFunction = (ident: string) => boolean;
 
-/** @typedef {import("./Logger").LogTypeEnum} LogTypeEnum */
+export type LoggerConsole = {
+	clear: () => void;
+	trace: () => void;
+	info: (...args: any[]) => void;
+	log: (...args: any[]) => void;
+	warn: (...args: any[]) => void;
+	error: (...args: any[]) => void;
+	debug?: (...args: any[]) => void;
+	group?: (...args: any[]) => void;
+	groupCollapsed?: (...args: any[]) => void;
+	groupEnd?: (...args: any[]) => void;
+	status?: (...args: any[]) => void;
+	profile?: (...args: any[]) => void;
+	profileEnd?: (...args: any[]) => void;
+	logTime?: (...args: any[]) => void;
+};
 
-/** @typedef {function(string): boolean} FilterFunction */
+export type LoggerOptions = {
+	level: "none" | "error" | "warn" | "info" | "log" | "verbose" | boolean;
+	debug: FilterTypes | boolean;
+	console: LoggerConsole;
+};
 
-/**
- * @typedef {Object} LoggerConsole
- * @property {function(): void} clear
- * @property {function(): void} trace
- * @property {(...args: any[]) => void} info
- * @property {(...args: any[]) => void} log
- * @property {(...args: any[]) => void} warn
- * @property {(...args: any[]) => void} error
- * @property {(...args: any[]) => void=} debug
- * @property {(...args: any[]) => void=} group
- * @property {(...args: any[]) => void=} groupCollapsed
- * @property {(...args: any[]) => void=} groupEnd
- * @property {(...args: any[]) => void=} status
- * @property {(...args: any[]) => void=} profile
- * @property {(...args: any[]) => void=} profileEnd
- * @property {(...args: any[]) => void=} logTime
- */
-
-/**
- * @typedef {Object} LoggerOptions
- * @property {false|true|"none"|"error"|"warn"|"info"|"log"|"verbose"} level loglevel
- * @property {FilterTypes|boolean} debug filter for debug logging
- * @property {LoggerConsole} console the console to log to
- */
-
-/**
- * @param {FilterItemTypes} item an input item
- * @returns {FilterFunction} filter function
- */
-const filterToFunction = item => {
+const filterToFunction = (
+	item: FilterItemTypes
+): FilterFunction | undefined => {
 	if (typeof item === "string") {
 		const regExp = new RegExp(
 			`[\\\\/]${item.replace(
@@ -67,9 +60,6 @@ const filterToFunction = item => {
 	}
 };
 
-/**
- * @enum {number}
- */
 const LogLevel = {
 	none: 6,
 	false: 6,
@@ -81,43 +71,33 @@ const LogLevel = {
 	verbose: 1
 };
 
-/**
- * @param {LoggerOptions} options options object
- * @returns {function(string, LogTypeEnum, any[]): void} logging function
- */
-export = ({ level = "info", debug = false, console }: any) => {
+const createConsoleLogger = ({
+	level = "info",
+	debug = false,
+	console
+}: LoggerOptions) => {
 	const debugFilters =
 		typeof debug === "boolean"
 			? [() => debug]
-			: /** @type {FilterItemTypes[]} */ [].concat(debug).map(filterToFunction);
-	/** @type {number} */
+			: ([] as FilterItemTypes[]).concat(debug).map(filterToFunction);
 	const loglevel = LogLevel[`${level}`] || 0;
 
-	/**
-	 * @param {string} name name of the logger
-	 * @param {LogTypeEnum} type type of the log entry
-	 * @param {any[]} args arguments of the log entry
-	 * @returns {void}
-	 */
-	const logger = (name, type, args) => {
+	const logger = (name: string, type: LogTypeEnum, args: any[]): void => {
 		const labeledArgs = () => {
 			if (Array.isArray(args)) {
 				if (args.length > 0 && typeof args[0] === "string") {
 					return [`[${name}] ${args[0]}`, ...args.slice(1)];
-				} else {
-					return [`[${name}]`, ...args];
 				}
-			} else {
-				return [];
+				return [`[${name}]`, ...args];
 			}
+			return [];
 		};
-		const debug = debugFilters.some(f => f(name));
+		const debug = debugFilters.some(f => f!(name));
 		switch (type) {
 			case LogType.debug:
 				if (!debug) return;
-				// eslint-disable-next-line node/no-unsupported-features/node-builtins
+
 				if (typeof console.debug === "function") {
-					// eslint-disable-next-line node/no-unsupported-features/node-builtins
 					console.debug(...labeledArgs());
 				} else {
 					console.log(...labeledArgs());
@@ -146,9 +126,7 @@ export = ({ level = "info", debug = false, console }: any) => {
 			case LogType.groupCollapsed:
 				if (!debug && loglevel > LogLevel.log) return;
 				if (!debug && loglevel > LogLevel.verbose) {
-					// eslint-disable-next-line node/no-unsupported-features/node-builtins
 					if (typeof console.groupCollapsed === "function") {
-						// eslint-disable-next-line node/no-unsupported-features/node-builtins
 						console.groupCollapsed(...labeledArgs());
 					} else {
 						console.log(...labeledArgs());
@@ -158,9 +136,8 @@ export = ({ level = "info", debug = false, console }: any) => {
 			// falls through
 			case LogType.group:
 				if (!debug && loglevel > LogLevel.log) return;
-				// eslint-disable-next-line node/no-unsupported-features/node-builtins
+
 				if (typeof console.group === "function") {
-					// eslint-disable-next-line node/no-unsupported-features/node-builtins
 					console.group(...labeledArgs());
 				} else {
 					console.log(...labeledArgs());
@@ -168,9 +145,8 @@ export = ({ level = "info", debug = false, console }: any) => {
 				break;
 			case LogType.groupEnd:
 				if (!debug && loglevel > LogLevel.log) return;
-				// eslint-disable-next-line node/no-unsupported-features/node-builtins
+
 				if (typeof console.groupEnd === "function") {
-					// eslint-disable-next-line node/no-unsupported-features/node-builtins
 					console.groupEnd();
 				}
 				break;
@@ -186,24 +162,19 @@ export = ({ level = "info", debug = false, console }: any) => {
 				break;
 			}
 			case LogType.profile:
-				// eslint-disable-next-line node/no-unsupported-features/node-builtins
 				if (typeof console.profile === "function") {
-					// eslint-disable-next-line node/no-unsupported-features/node-builtins
 					console.profile(...labeledArgs());
 				}
 				break;
 			case LogType.profileEnd:
-				// eslint-disable-next-line node/no-unsupported-features/node-builtins
 				if (typeof console.profileEnd === "function") {
-					// eslint-disable-next-line node/no-unsupported-features/node-builtins
 					console.profileEnd(...labeledArgs());
 				}
 				break;
 			case LogType.clear:
 				if (!debug && loglevel > LogLevel.log) return;
-				// eslint-disable-next-line node/no-unsupported-features/node-builtins
+
 				if (typeof console.clear === "function") {
-					// eslint-disable-next-line node/no-unsupported-features/node-builtins
 					console.clear();
 				}
 				break;
@@ -227,3 +198,5 @@ export = ({ level = "info", debug = false, console }: any) => {
 	};
 	return logger;
 };
+
+export { createConsoleLogger };

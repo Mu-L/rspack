@@ -1,11 +1,47 @@
-import path from "path";
-import { pathToFileURL } from "url";
-import fs from "fs";
-import { RspackCLIOptions } from "../types";
-import { RspackOptions, MultiRspackOptions } from "@rspack/core";
+import fs from "node:fs";
+import path from "node:path";
+import type { MultiRspackOptions, RspackOptions } from "@rspack/core";
+import type { RspackCLIOptions } from "../types";
+import { crossImport } from "./crossImport";
+import findConfig from "./findConfig";
+import isEsmFile from "./isEsmFile";
+import isTsFile from "./isTsFile";
 
-const supportedExtensions = [".js", ".ts", ".mjs", ".cjs"];
-const defaultConfig = "rspack.config";
+interface RechoirError extends Error {
+	failures: RechoirError[];
+	error: Error;
+}
+
+const DEFAULT_CONFIG_NAME = "rspack.config" as const;
+
+const registerLoader = async (configPath: string) => {
+	const ext = path.extname(configPath);
+	// TODO implement good `.mts` support after https://github.com/gulpjs/rechoir/issues/43
+	// For ESM and `.mts` you need to use: 'NODE_OPTIONS="--loader ts-node/esm" rspack build --config ./rspack.config.mts'
+	if (isEsmFile(configPath) && isTsFile(configPath)) {
+		return;
+	}
+
+	const { default: interpret } = await import("interpret");
+	const extensions = Object.fromEntries(
+		Object.entries(interpret.extensions).filter(([key]) => key === ext)
+	);
+	if (Object.keys(extensions).length === 0) {
+		throw new Error(`config file "${configPath}" is not supported.`);
+	}
+
+	try {
+		const { default: rechoir } = await import("rechoir");
+		rechoir.prepare(extensions, configPath);
+	} catch (error) {
+		const failures = (error as RechoirError)?.failures;
+		if (failures) {
+			const messages = failures.map(failure => failure.error.message);
+			throw new Error(`${messages.join("\n")}`);
+		}
+		throw error;
+	}
+};
 
 export type LoadedRspackConfig =
 	| undefined
@@ -13,70 +49,30 @@ export type LoadedRspackConfig =
 	| MultiRspackOptions
 	| ((
 			env: Record<string, any>,
-			argv: Record<string, any>
+			argv?: Record<string, any>
 	  ) => RspackOptions | MultiRspackOptions);
 
 export async function loadRspackConfig(
-	options: RspackCLIOptions
+	options: RspackCLIOptions,
+	cwd = process.cwd()
 ): Promise<LoadedRspackConfig> {
-	let loadedConfig: LoadedRspackConfig;
-	// if we pass config paras
 	if (options.config) {
-		const resolvedConfigPath = path.resolve(process.cwd(), options.config);
-		if (!fs.existsSync(resolvedConfigPath)) {
-			throw new Error(`config file "${resolvedConfigPath}" not exists`);
+		const configPath = path.resolve(cwd, options.config);
+		if (!fs.existsSync(configPath)) {
+			throw new Error(`config file "${configPath}" not found.`);
 		}
-		loadedConfig = await requireWithAdditionalExtension(resolvedConfigPath);
-	} else {
-		let defaultConfigPath = findFileWithSupportedExtensions(
-			path.resolve(process.cwd(), defaultConfig)
-		);
-		if (defaultConfigPath != null) {
-			loadedConfig = await requireWithAdditionalExtension(defaultConfigPath);
-		} else {
-			loadedConfig = {};
+		if (isTsFile(configPath) && options["config-loader"] === "register") {
+			await registerLoader(configPath);
 		}
+		return crossImport(configPath, cwd);
 	}
-	return loadedConfig;
-}
 
-// takes a basePath like `webpack.config`, return `webpack.config.{js,ts}` if
-// exists. returns null if none of them exists
-export function findFileWithSupportedExtensions(
-	basePath: string
-): string | null {
-	for (const extension of supportedExtensions) {
-		if (fs.existsSync(basePath + extension)) {
-			return basePath + extension;
+	const defaultConfig = findConfig(path.resolve(cwd, DEFAULT_CONFIG_NAME));
+	if (defaultConfig) {
+		if (isTsFile(defaultConfig) && options["config-loader"] === "register") {
+			await registerLoader(defaultConfig);
 		}
+		return crossImport(defaultConfig, cwd);
 	}
-	return null;
-}
-
-let hasRegisteredTS = false;
-async function requireWithAdditionalExtension(resolvedPath: string) {
-	if (resolvedPath.endsWith("ts") && !hasRegisteredTS) {
-		hasRegisteredTS = true;
-		let tsNode: any;
-		try {
-			tsNode = require("ts-node");
-		} catch (e) {
-			throw new Error("`ts-node` is required to use TypeScript configuration.");
-		}
-		tsNode.register({ transpileOnly: true });
-	}
-	let loadedConfig;
-	if (resolvedPath.endsWith("ts")) {
-		loadedConfig = require(resolvedPath);
-	} else if (resolvedPath.endsWith(".cjs")) {
-		/**
-		 * this is a dirty hack to help us test rsapck-cli because we can't dynamic import js config due to [nodejs bug](https://github.com/nodejs/node/issues/35889) in jest
-		 */
-		loadedConfig = require(resolvedPath);
-	} else {
-		// dynamic import can handle both cjs & mjs
-		const fileUrl = pathToFileURL(resolvedPath).href;
-		loadedConfig = (await import(fileUrl)).default;
-	}
-	return loadedConfig;
+	return {};
 }

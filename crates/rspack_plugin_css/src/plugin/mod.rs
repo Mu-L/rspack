@@ -1,193 +1,115 @@
 #![allow(clippy::comparison_chain)]
 mod impl_plugin_for_css_plugin;
-use std::cmp;
-use std::hash::Hash;
-use std::str::FromStr;
+use std::cmp::{self, Reverse};
 
-use anyhow::bail;
-use bitflags::bitflags;
-use itertools::Itertools;
-use once_cell::sync::Lazy;
-use regex::Regex;
-use rspack_core::{Chunk, ChunkGraph, Compilation, Module, ModuleGraph, PathData, SourceType};
-use rspack_core::{Filename, ModuleIdentifier};
-use rspack_identifier::IdentifierSet;
+use rspack_collections::{DatabaseItem, IdentifierSet};
+use rspack_core::{Chunk, Compilation, Module};
+use rspack_core::{ChunkUkey, ModuleIdentifier};
+use rspack_hook::plugin;
 
-use crate::pxtorem::options::PxToRemOptions;
-
-static ESCAPE_LOCAL_IDENT_REGEX: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r#"[<>:"/\\|?*\.]"#).expect("Invalid regex"));
+#[plugin]
+#[derive(Debug, Default)]
+pub struct CssPlugin;
 
 #[derive(Debug)]
-pub struct CssPlugin {
-  config: CssConfig,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct PostcssConfig {
-  pub pxtorem: Option<PxToRemOptions>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ModulesConfig {
-  pub locals_convention: LocalsConvention,
-  pub local_ident_name: LocalIdentName,
-  pub exports_only: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct LocalIdentName(Filename);
-
-impl LocalIdentName {
-  pub fn render(&self, options: LocalIdentNameRenderOptions) -> String {
-    let mut s = self.0.render(options.path_data, None);
-    if let Some(local) = options.local {
-      s = s.replace("[local]", local);
-    }
-    s = ESCAPE_LOCAL_IDENT_REGEX.replace_all(&s, "-").into_owned();
-    s
-  }
-}
-
-impl From<String> for LocalIdentName {
-  fn from(value: String) -> Self {
-    Self(Filename::from(value))
-  }
-}
-
-pub struct LocalIdentNameRenderOptions<'a> {
-  pub path_data: PathData<'a>,
-  pub local: Option<&'a str>,
-}
-
-bitflags! {
-  struct LocalsConventionFlags: u8 {
-    const ASIS = 1 << 0;
-    const CAMELCASE = 1 << 1;
-    const DASHES = 1 << 2;
-  }
-}
-
-#[derive(Debug, Clone)]
-pub struct LocalsConvention(LocalsConventionFlags);
-
-impl LocalsConvention {
-  pub fn as_is(&self) -> bool {
-    self.0.contains(LocalsConventionFlags::ASIS)
-  }
-
-  pub fn camel_case(&self) -> bool {
-    self.0.contains(LocalsConventionFlags::CAMELCASE)
-  }
-
-  pub fn dashes(&self) -> bool {
-    self.0.contains(LocalsConventionFlags::DASHES)
-  }
-}
-
-impl FromStr for LocalsConvention {
-  type Err = anyhow::Error;
-
-  fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-    Ok(match s {
-      "asIs" => Self(LocalsConventionFlags::ASIS),
-      "camelCase" => Self(LocalsConventionFlags::ASIS | LocalsConventionFlags::CAMELCASE),
-      "camelCaseOnly" => Self(LocalsConventionFlags::CAMELCASE),
-      "dashes" => Self(LocalsConventionFlags::ASIS | LocalsConventionFlags::DASHES),
-      "dashesOnly" => Self(LocalsConventionFlags::DASHES),
-      _ => bail!("css modules exportsLocalsConvention error"),
-    })
-  }
-}
-
-impl Default for LocalsConvention {
-  fn default() -> Self {
-    Self(LocalsConventionFlags::ASIS)
-  }
-}
-
-#[derive(Debug, Clone)]
-pub struct CssConfig {
-  pub targets: Vec<String>,
-  pub postcss: PostcssConfig,
-  pub modules: ModulesConfig,
+pub struct CssOrderConflicts {
+  pub chunk: ChunkUkey,
+  pub failed_module: ModuleIdentifier,
+  pub selected_module: ModuleIdentifier,
 }
 
 impl CssPlugin {
-  pub fn new(config: CssConfig) -> Self {
-    Self { config }
-  }
-
-  pub(crate) fn get_ordered_chunk_css_modules<'module>(
+  pub(crate) fn get_ordered_chunk_css_modules<'a>(
     chunk: &Chunk,
-    chunk_graph: &'module ChunkGraph,
-    module_graph: &'module ModuleGraph,
     compilation: &Compilation,
-  ) -> Vec<ModuleIdentifier> {
-    // Align with https://github.com/webpack/webpack/blob/8241da7f1e75c5581ba535d127fa66aeb9eb2ac8/lib/css/CssModulesPlugin.js#L368
-    let mut css_modules = chunk_graph
-      .get_chunk_modules_iterable_by_source_type(&chunk.ukey, SourceType::Css, module_graph)
-      .collect::<Vec<_>>();
+    mut css_import_modules: Vec<&'a dyn Module>,
+    mut css_modules: Vec<&'a dyn Module>,
+  ) -> (Vec<&'a dyn Module>, Option<Vec<CssOrderConflicts>>) {
+    css_import_modules.sort_unstable_by_key(|module| module.identifier());
+    let (mut external_css_modules, conflicts_external) =
+      Self::get_modules_in_order(chunk, css_import_modules, compilation);
+
     css_modules.sort_unstable_by_key(|module| module.identifier());
+    let (mut css_modules, conflicts) = Self::get_modules_in_order(chunk, css_modules, compilation);
 
-    let css_modules: Vec<ModuleIdentifier> =
-      Self::get_modules_in_order(chunk, css_modules, compilation);
+    external_css_modules.append(&mut css_modules);
 
-    css_modules
-  }
-
-  pub(crate) fn get_modules_in_order(
-    chunk: &Chunk,
-    modules: Vec<&dyn Module>,
-    compilation: &Compilation,
-  ) -> Vec<ModuleIdentifier> {
-    // Align with https://github.com/webpack/webpack/blob/8241da7f1e75c5581ba535d127fa66aeb9eb2ac8/lib/css/CssModulesPlugin.js#L269
-    if modules.is_empty() {
-      return vec![];
+    let conflicts = match (conflicts_external, conflicts) {
+      (Some(a), None) => Some(a),
+      (None, Some(b)) => Some(b),
+      (Some(mut a), Some(mut b)) => {
+        a.append(&mut b);
+        Some(a)
+      }
+      (None, None) => None,
     };
 
-    let modules_list = modules.into_iter().map(|m| m.identifier()).collect_vec();
+    (external_css_modules, conflicts)
+  }
+
+  pub fn get_modules_in_order<'module>(
+    chunk: &Chunk,
+    modules: Vec<&'module dyn Module>,
+    compilation: &Compilation,
+  ) -> (Vec<&'module dyn Module>, Option<Vec<CssOrderConflicts>>) {
+    // Align with https://github.com/webpack/webpack/blob/8241da7f1e75c5581ba535d127fa66aeb9eb2ac8/lib/css/CssModulesPlugin.js#L269
+    if modules.is_empty() {
+      return (vec![], None);
+    };
+
+    let modules_list = modules.clone();
 
     // Get ordered list of modules per chunk group
-    // Lists are in reverse order to allow to use Array.pop()
+
     let mut modules_by_chunk_group = chunk
-      .groups
+      .groups()
       .iter()
-      .filter_map(|ukey| compilation.chunk_group_by_ukey.get(ukey))
+      .map(|group| compilation.chunk_group_by_ukey.expect_get(group))
       .map(|chunk_group| {
-        let sorted_modules = modules_list
+        let mut indexed_modules = modules_list
           .clone()
           .into_iter()
-          .filter_map(|module_id| {
-            let order = chunk_group.module_post_order_index(&module_id);
-            order.map(|order| (module_id, order))
+          .filter_map(|module| {
+            // ->: import
+            // For A -> B -> C, the pre order is A: 0, B: 1, C: 2.
+            // The post order is A: 2, B: 1, C: 0.
+            chunk_group
+              .module_post_order_index(&module.identifier())
+              .map(|index| (index, module))
           })
-          .sorted_by(|a, b| {
-            if b.1 > a.1 {
-              std::cmp::Ordering::Less
-            } else if b.1 < a.1 {
-              std::cmp::Ordering::Greater
-            } else {
-              std::cmp::Ordering::Equal
-            }
-          })
-          .map(|item| item.0)
-          .collect_vec();
+          .collect::<Vec<_>>();
+
+        // After sort, we get a list [A, B, C].
+        // Lists are in reverse order to allow to use `.pop()`
+        let sorted_modules = {
+          indexed_modules.sort_by_key(|item| Reverse(item.0));
+          indexed_modules
+            .into_iter()
+            .map(|item| item.1)
+            .collect::<Vec<_>>()
+        };
 
         SortedModules {
-          set: sorted_modules.clone().into_iter().collect(),
+          set: sorted_modules.iter().map(|m| m.identifier()).collect(),
           list: sorted_modules,
         }
       })
       .collect::<Vec<_>>();
 
     if modules_by_chunk_group.len() == 1 {
-      return modules_by_chunk_group[0].list.clone();
+      let mut ret = modules_by_chunk_group
+        .into_iter()
+        .next()
+        .expect("must have one")
+        .list;
+      ret.reverse();
+      return (ret, None);
     };
 
     modules_by_chunk_group.sort_unstable_by(compare_module_lists);
 
-    let mut final_modules: Vec<ModuleIdentifier> = vec![];
+    let mut final_modules: Vec<&'module dyn Module> = vec![];
+    let mut conflicts: Option<Vec<CssOrderConflicts>> = None;
 
     loop {
       let mut failed_modules: IdentifierSet = Default::default();
@@ -204,14 +126,14 @@ impl CssPlugin {
             continue;
           }
           let last_module = *list.last().expect("TODO:");
-          if last_module != selected_module {
+          if last_module.identifier() == selected_module.identifier() {
             continue;
           }
-          if !set.contains(&selected_module) {
+          if !set.contains(&selected_module.identifier()) {
             continue;
           }
-          failed_modules.insert(selected_module);
-          if failed_modules.contains(&last_module) {
+          failed_modules.insert(selected_module.identifier());
+          if failed_modules.contains(&last_module.identifier()) {
             // There is a conflict, try other alternatives
             has_failed = Some(last_module);
             continue;
@@ -226,6 +148,16 @@ impl CssPlugin {
         // There is a not resolve-able conflict with the selectedModule
         // TODO(hyf0): we should emit a warning here
         tracing::warn!("Conflicting order between");
+        let conflict = CssOrderConflicts {
+          chunk: chunk.ukey(),
+          failed_module: has_failed.identifier(),
+          selected_module: selected_module.identifier(),
+        };
+        if let Some(conflicts) = &mut conflicts {
+          conflicts.push(conflict);
+        } else {
+          conflicts = Some(vec![conflict])
+        }
         // 		if (compilation) {
         // 			// TODO print better warning
         // 			compilation.warnings.push(
@@ -248,11 +180,15 @@ impl CssPlugin {
       // Remove the selected module from all lists
       for SortedModules { set, list } in &mut modules_by_chunk_group {
         let last_module = list.last();
-        if last_module.map_or(false, |last_module| last_module == &selected_module) {
+        if last_module
+          .is_some_and(|last_module| last_module.identifier() == selected_module.identifier())
+        {
           list.pop();
-          set.remove(&selected_module);
-        } else if has_failed.is_some() && set.contains(&selected_module) {
-          let idx = list.iter().position(|m| m == &selected_module);
+          set.remove(&selected_module.identifier());
+        } else if has_failed.is_some() && set.contains(&selected_module.identifier()) {
+          let idx = list
+            .iter()
+            .position(|m| m.identifier() == selected_module.identifier());
           if let Some(idx) = idx {
             list.remove(idx);
           }
@@ -261,12 +197,13 @@ impl CssPlugin {
 
       modules_by_chunk_group.sort_unstable_by(compare_module_lists);
     }
-    final_modules
+    (final_modules, conflicts)
   }
 }
 
-struct SortedModules {
-  pub list: Vec<ModuleIdentifier>,
+#[derive(Debug)]
+struct SortedModules<'module> {
+  pub list: Vec<&'module dyn Module>,
   pub set: IdentifierSet,
 }
 
@@ -282,7 +219,10 @@ fn compare_module_lists(a: &SortedModules, b: &SortedModules) -> cmp::Ordering {
   } else if b.is_empty() {
     cmp::Ordering::Less
   } else {
-    compare_modules_by_identifier(a.last().expect("TODO:"), b.last().expect("TODO:"))
+    compare_modules_by_identifier(
+      &a.last().expect("Must have a module").identifier(),
+      &b.last().expect("Must have a module").identifier(),
+    )
   }
 }
 

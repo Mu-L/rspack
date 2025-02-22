@@ -1,13 +1,32 @@
 use std::hash::Hash;
+use std::sync::LazyLock;
 
+use regex::Regex;
+use rspack_collections::DatabaseItem;
+use rspack_core::rspack_sources::SourceExt;
 use rspack_core::{
-  rspack_sources::{ConcatSource, RawSource, SourceExt},
-  Chunk, Compilation, Filename, JsChunkHashArgs, LibraryOptions, PathData, Plugin, PluginContext,
-  PluginJsChunkHashHookOutput, PluginRenderHookOutput, PluginRenderStartupHookOutput, RenderArgs,
-  RenderStartupArgs, SourceType,
+  get_entry_runtime, property_access, ApplyContext, BoxModule, ChunkUkey,
+  CodeGenerationDataTopLevelDeclarations, CompilationAdditionalChunkRuntimeRequirements,
+  CompilationFinishModules, CompilationParams, CompilerCompilation, CompilerOptions, EntryData,
+  FilenameTemplate, LibraryExport, LibraryName, LibraryNonUmdObject, ModuleIdentifier,
+  RuntimeGlobals, UsageState,
 };
+use rspack_core::{
+  rspack_sources::{ConcatSource, RawStringSource},
+  to_identifier, Chunk, Compilation, LibraryOptions, PathData, Plugin, PluginContext, SourceType,
+};
+use rspack_error::{error, error_bail, Result};
+use rspack_hash::RspackHash;
+use rspack_hook::{plugin, plugin_hook};
+use rspack_plugin_javascript::{
+  JavascriptModulesChunkHash, JavascriptModulesEmbedInRuntimeBailout, JavascriptModulesRender,
+  JavascriptModulesRenderStartup, JavascriptModulesStrictRuntimeBailout, JsPlugin, RenderSource,
+};
+use rspack_util::infallible::ResultInfallibleExt as _;
 
-use crate::utils::property_access;
+use crate::utils::{get_options_for_chunk, COMMON_LIBRARY_NAME_MESSAGE};
+
+const PLUGIN_NAME: &str = "rspack.AssignLibraryPlugin";
 
 #[derive(Debug)]
 pub enum Unnamed {
@@ -24,14 +43,47 @@ pub enum Named {
 }
 
 #[derive(Debug)]
+pub enum Prefix {
+  Global,
+  Array(Vec<String>),
+}
+
+impl Prefix {
+  pub fn value(&self, compilation: &Compilation) -> Vec<String> {
+    match self {
+      Prefix::Global => vec![compilation.options.output.global_object.clone()],
+      Prefix::Array(v) => v.clone(),
+    }
+  }
+
+  pub fn len(&self) -> usize {
+    match self {
+      Prefix::Global => 1,
+      Prefix::Array(v) => v.len(),
+    }
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
+}
+
+#[derive(Debug)]
 pub struct AssignLibraryPluginOptions {
   pub library_type: String,
-  pub prefix: Vec<String>,
+  pub prefix: Prefix,
   pub declare: bool,
   pub unnamed: Unnamed,
   pub named: Option<Named>,
 }
 
+#[derive(Debug)]
+struct AssignLibraryPluginParsed<'a> {
+  name: Option<&'a LibraryNonUmdObject>,
+  export: Option<&'a LibraryExport>,
+}
+
+#[plugin]
 #[derive(Debug)]
 pub struct AssignLibraryPlugin {
   options: AssignLibraryPluginOptions,
@@ -39,134 +91,382 @@ pub struct AssignLibraryPlugin {
 
 impl AssignLibraryPlugin {
   pub fn new(options: AssignLibraryPluginOptions) -> Self {
-    Self { options }
+    Self::new_inner(options)
   }
 
-  pub fn get_resolved_full_name(&self, compilation: &Compilation, chunk: &Chunk) -> Vec<String> {
-    if let Some(library) = &compilation.options.output.library {
-      if let Some(name) = &library.name {
-        if let Some(root) = &name.root {
-          let mut prefix = self.options.prefix.clone();
-          prefix.extend(
-            root
-              .iter()
-              .map(|v| {
-                compilation.get_path(
-                  &Filename::from(v.to_owned()),
-                  PathData::default().chunk(chunk).content_hash_optional(
-                    chunk
-                      .content_hash
-                      .get(&SourceType::JavaScript)
-                      .map(|i| i.as_str()),
-                  ),
-                )
-              })
-              .collect::<Vec<_>>(),
-          );
-          return prefix;
-        }
+  fn parse_options<'a>(
+    &self,
+    library: &'a LibraryOptions,
+  ) -> Result<AssignLibraryPluginParsed<'a>> {
+    if matches!(self.options.unnamed, Unnamed::Error) {
+      if !matches!(
+        library.name,
+        Some(LibraryName::NonUmdObject(LibraryNonUmdObject::Array(_)))
+          | Some(LibraryName::NonUmdObject(LibraryNonUmdObject::String(_)))
+      ) {
+        error_bail!("Library name must be a string or string array. {COMMON_LIBRARY_NAME_MESSAGE}")
       }
+    } else if let Some(name) = &library.name
+      && !matches!(
+        name,
+        LibraryName::NonUmdObject(LibraryNonUmdObject::Array(_))
+          | LibraryName::NonUmdObject(LibraryNonUmdObject::String(_))
+      )
+    {
+      error_bail!(
+        "Library name must be a string, string array or unset. {COMMON_LIBRARY_NAME_MESSAGE}"
+      )
     }
-    self.options.prefix.clone()
+    Ok(AssignLibraryPluginParsed {
+      name: library.name.as_ref().map(|n| match n {
+        LibraryName::NonUmdObject(n) => n,
+        _ => unreachable!("Library name must be a string, string array or unset."),
+      }),
+      export: library.export.as_ref(),
+    })
+  }
+
+  fn get_options_for_chunk<'a>(
+    &self,
+    compilation: &'a Compilation,
+    chunk_ukey: &ChunkUkey,
+  ) -> Result<Option<AssignLibraryPluginParsed<'a>>> {
+    get_options_for_chunk(compilation, chunk_ukey)
+      .filter(|library| library.library_type == self.options.library_type)
+      .map(|library| self.parse_options(library))
+      .transpose()
+  }
+
+  fn is_copy(&self, options: &AssignLibraryPluginParsed) -> bool {
+    if options.name.is_some() {
+      matches!(self.options.named, Some(Named::Copy))
+    } else {
+      matches!(self.options.unnamed, Unnamed::Copy)
+    }
+  }
+
+  fn get_resolved_full_name(
+    &self,
+    options: &AssignLibraryPluginParsed,
+    compilation: &Compilation,
+    chunk: &Chunk,
+  ) -> Vec<String> {
+    if let Some(name) = options.name {
+      let mut prefix = self.options.prefix.value(compilation);
+      let get_path = |v: &str| {
+        compilation
+          .get_path(
+            &FilenameTemplate::from(v.to_owned()),
+            PathData::default()
+              .chunk_id_optional(
+                chunk
+                  .id(&compilation.chunk_ids_artifact)
+                  .map(|id| id.as_str()),
+              )
+              .chunk_hash_optional(chunk.rendered_hash(
+                &compilation.chunk_hashes_artifact,
+                compilation.options.output.hash_digest_length,
+              ))
+              .chunk_name_optional(
+                chunk.name_for_filename_template(&compilation.chunk_ids_artifact),
+              )
+              .content_hash_optional(chunk.rendered_content_hash_by_source_type(
+                &compilation.chunk_hashes_artifact,
+                &SourceType::JavaScript,
+                compilation.options.output.hash_digest_length,
+              )),
+          )
+          .always_ok()
+      };
+      match name {
+        LibraryNonUmdObject::Array(arr) => {
+          prefix.extend(arr.iter().map(|s| get_path(s)).collect::<Vec<_>>());
+        }
+        LibraryNonUmdObject::String(s) => prefix.push(get_path(s)),
+      };
+      return prefix;
+    }
+    self.options.prefix.value(compilation)
   }
 }
 
+#[plugin_hook(CompilerCompilation for AssignLibraryPlugin)]
+async fn compilation(
+  &self,
+  compilation: &mut Compilation,
+  _params: &mut CompilationParams,
+) -> Result<()> {
+  let mut hooks = JsPlugin::get_compilation_hooks_mut(compilation.id());
+  hooks.render.tap(render::new(self));
+  hooks.render_startup.tap(render_startup::new(self));
+  hooks.chunk_hash.tap(js_chunk_hash::new(self));
+  hooks
+    .embed_in_runtime_bailout
+    .tap(embed_in_runtime_bailout::new(self));
+  hooks
+    .strict_runtime_bailout
+    .tap(strict_runtime_bailout::new(self));
+  Ok(())
+}
+
+#[plugin_hook(JavascriptModulesRender for AssignLibraryPlugin)]
+fn render(
+  &self,
+  compilation: &Compilation,
+  chunk_ukey: &ChunkUkey,
+  render_source: &mut RenderSource,
+) -> Result<()> {
+  let Some(options) = self.get_options_for_chunk(compilation, chunk_ukey)? else {
+    return Ok(());
+  };
+  if self.options.declare {
+    let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
+    let base = &self.get_resolved_full_name(&options, compilation, chunk)[0];
+    if !is_name_valid(base) {
+      let base_identifier = to_identifier(base);
+      return Err(
+        error!("Library name base ({base}) must be a valid identifier when using a var declaring library type. Either use a valid identifier (e. g. {base_identifier}) or use a different library type (e. g. `type: 'global'`, which assign a property on the global scope instead of declaring a variable). {COMMON_LIBRARY_NAME_MESSAGE}"),
+      );
+    }
+    let mut source = ConcatSource::default();
+    source.add(RawStringSource::from(format!("var {base};\n")));
+    source.add(render_source.source.clone());
+    render_source.source = source.boxed();
+    return Ok(());
+  }
+  Ok(())
+}
+
+#[plugin_hook(JavascriptModulesRenderStartup for AssignLibraryPlugin)]
+fn render_startup(
+  &self,
+  compilation: &Compilation,
+  chunk_ukey: &ChunkUkey,
+  _module: &ModuleIdentifier,
+  render_source: &mut RenderSource,
+) -> Result<()> {
+  let Some(options) = self.get_options_for_chunk(compilation, chunk_ukey)? else {
+    return Ok(());
+  };
+  let mut source = ConcatSource::default();
+  source.add(render_source.source.clone());
+  let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
+  let full_name_resolved = self.get_resolved_full_name(&options, compilation, chunk);
+  let export_access = options
+    .export
+    .map(|e| property_access(e, 0))
+    .unwrap_or_default();
+  if matches!(self.options.unnamed, Unnamed::Static) {
+    let export_target = access_with_init(&full_name_resolved, self.options.prefix.len(), true);
+    source.add(RawStringSource::from(format!(
+      "Object.defineProperty({export_target}, '__esModule', {{ value: true }});\n",
+    )));
+  } else if self.is_copy(&options) {
+    source.add(RawStringSource::from(format!(
+      "var __webpack_export_target__ = {};\n",
+      access_with_init(&full_name_resolved, self.options.prefix.len(), true)
+    )));
+    let mut exports = "__webpack_exports__";
+    if !export_access.is_empty() {
+      source.add(RawStringSource::from(format!(
+        "var __webpack_exports_export__ = __webpack_exports__{export_access};\n"
+      )));
+      exports = "__webpack_exports_export__";
+    }
+    source.add(RawStringSource::from(format!(
+      "for(var __webpack_i__ in {exports}) __webpack_export_target__[__webpack_i__] = {exports}[__webpack_i__];\n"
+    )));
+    source.add(RawStringSource::from(format!(
+      "if({exports}.__esModule) Object.defineProperty(__webpack_export_target__, '__esModule', {{ value: true }});\n"
+    )));
+  } else {
+    source.add(RawStringSource::from(format!(
+      "{} = __webpack_exports__{export_access};\n",
+      access_with_init(&full_name_resolved, self.options.prefix.len(), false)
+    )));
+  }
+  render_source.source = source.boxed();
+  Ok(())
+}
+
+#[plugin_hook(JavascriptModulesChunkHash for AssignLibraryPlugin)]
+async fn js_chunk_hash(
+  &self,
+  compilation: &Compilation,
+  chunk_ukey: &ChunkUkey,
+  hasher: &mut RspackHash,
+) -> Result<()> {
+  let Some(options) = self.get_options_for_chunk(compilation, chunk_ukey)? else {
+    return Ok(());
+  };
+  PLUGIN_NAME.hash(hasher);
+  let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
+  let full_resolved_name = self.get_resolved_full_name(&options, compilation, chunk);
+  if self.is_copy(&options) {
+    "copy".hash(hasher);
+  }
+  if self.options.declare {
+    self.options.declare.hash(hasher);
+  }
+  full_resolved_name.join(".").hash(hasher);
+  if let Some(export) = options.export {
+    export.hash(hasher);
+  }
+  Ok(())
+}
+
+#[plugin_hook(JavascriptModulesEmbedInRuntimeBailout for AssignLibraryPlugin)]
+fn embed_in_runtime_bailout(
+  &self,
+  compilation: &Compilation,
+  module: &BoxModule,
+  chunk: &Chunk,
+) -> Result<Option<String>> {
+  let Some(options) = self.get_options_for_chunk(compilation, &chunk.ukey())? else {
+    return Ok(None);
+  };
+  let codegen = compilation
+    .code_generation_results
+    .get(&module.identifier(), Some(chunk.runtime()));
+  let top_level_decls = codegen
+    .data
+    .get::<CodeGenerationDataTopLevelDeclarations>()
+    .map(|d| d.inner())
+    .or_else(|| module.build_info().top_level_declarations.as_ref());
+  if let Some(top_level_decls) = top_level_decls {
+    let full_name = self.get_resolved_full_name(&options, compilation, chunk);
+    if let Some(base) = full_name.first()
+      && top_level_decls.contains(&base.as_str().into())
+    {
+      return Ok(Some(format!(
+        "it declares '{base}' on top-level, which conflicts with the current library output."
+      )));
+    }
+    return Ok(None);
+  }
+  Ok(Some(
+    "it doesn't tell about top level declarations.".to_string(),
+  ))
+}
+
+#[plugin_hook(JavascriptModulesStrictRuntimeBailout for AssignLibraryPlugin)]
+fn strict_runtime_bailout(
+  &self,
+  compilation: &Compilation,
+  chunk_ukey: &ChunkUkey,
+) -> Result<Option<String>> {
+  let Some(options) = self.get_options_for_chunk(compilation, chunk_ukey)? else {
+    return Ok(None);
+  };
+  if self.options.declare
+    || matches!(self.options.prefix, Prefix::Global)
+    || !self.options.prefix.is_empty()
+    || options.name.is_none()
+  {
+    return Ok(None);
+  }
+  Ok(Some(
+    "a global variable is assign and maybe created".to_string(),
+  ))
+}
+
+#[plugin_hook(CompilationFinishModules for AssignLibraryPlugin)]
+async fn finish_modules(&self, compilation: &mut Compilation) -> Result<()> {
+  let mut runtime_info = Vec::with_capacity(compilation.entries.len());
+  for (entry_name, entry) in compilation.entries.iter() {
+    let EntryData {
+      dependencies,
+      options,
+      ..
+    } = entry;
+    let runtime = get_entry_runtime(entry_name, options, &compilation.entries);
+    let library_options = options
+      .library
+      .as_ref()
+      .or_else(|| compilation.options.output.library.as_ref());
+    let module_graph = compilation.get_module_graph();
+    let module_of_last_dep = dependencies
+      .last()
+      .and_then(|dep| module_graph.get_module_by_dependency_id(dep));
+    let Some(module_of_last_dep) = module_of_last_dep else {
+      continue;
+    };
+    let Some(library_options) = library_options else {
+      continue;
+    };
+    if let Some(export) = library_options
+      .export
+      .as_ref()
+      .and_then(|item| item.first())
+    {
+      runtime_info.push((
+        runtime,
+        Some(export.clone()),
+        module_of_last_dep.identifier(),
+      ));
+    } else {
+      runtime_info.push((runtime, None, module_of_last_dep.identifier()));
+    }
+  }
+
+  for (runtime, export, module_identifier) in runtime_info {
+    let mut module_graph = compilation.get_module_graph_mut();
+    if let Some(export) = export {
+      let export_info = module_graph.get_export_info(module_identifier, &(export.as_str()).into());
+      export_info.set_used(&mut module_graph, UsageState::Used, Some(&runtime));
+      export_info.set_can_mangle_use(&mut module_graph, Some(false));
+    } else {
+      let exports_info = module_graph.get_exports_info(&module_identifier);
+      exports_info.set_used_in_unknown_way(&mut module_graph, Some(&runtime));
+    }
+  }
+  Ok(())
+}
+
+#[async_trait::async_trait]
 impl Plugin for AssignLibraryPlugin {
   fn name(&self) -> &'static str {
-    "AssignLibraryPlugin"
+    PLUGIN_NAME
   }
 
-  fn render(&self, _ctx: PluginContext, args: &RenderArgs) -> PluginRenderHookOutput {
-    if self.options.declare {
-      let base = &self.get_resolved_full_name(args.compilation, args.chunk())[0];
-      let mut source = ConcatSource::default();
-      source.add(RawSource::from(format!("var {base};\n")));
-      source.add(args.source.clone());
-      return Ok(Some(source.boxed()));
-    }
-    Ok(Some(args.source.clone()))
-  }
-
-  fn render_startup(
-    &self,
-    _ctx: PluginContext,
-    args: &RenderStartupArgs,
-  ) -> PluginRenderStartupHookOutput {
-    let mut source = ConcatSource::default();
-    source.add(args.source.clone());
-    // TODO: respect entryOptions.library
-    let library = &args.compilation.options.output.library;
-    let is_copy = if let Some(library) = library {
-      if library.name.is_some() {
-        matches!(self.options.named, Some(Named::Copy))
-      } else {
-        matches!(self.options.unnamed, Unnamed::Copy)
-      }
-    } else {
-      false
-    };
-    let full_name_resolved = self.get_resolved_full_name(args.compilation, args.chunk());
-    let export_access = property_library(library);
-    if matches!(self.options.unnamed, Unnamed::Static) {
-      let export_target = access_with_init(&full_name_resolved, self.options.prefix.len(), true);
-      source.add(RawSource::from(format!(
-        "Object.defineProperty({export_target}, '__esModule', {{ value: true }});\n",
-      )));
-    } else if is_copy {
-      source.add(RawSource::from(format!(
-        "var __webpack_export_target__ = {};\n",
-        access_with_init(&full_name_resolved, self.options.prefix.len(), true)
-      )));
-      let mut exports = "__webpack_exports__";
-      if !export_access.is_empty() {
-        source.add(RawSource::from(format!(
-          "var __webpack_exports_export__ = __webpack_exports__{export_access};\n"
-        )));
-        exports = "__webpack_exports_export__";
-      }
-      source.add(RawSource::from(format!(
-        "for(var i in {exports}) __webpack_export_target__[i] = {exports}[i];\n"
-      )));
-      source.add(RawSource::from(format!(
-        "if({exports}.__esModule) Object.defineProperty(__webpack_export_target__, '__esModule', {{ value: true }});\n"
-      )));
-    } else {
-      source.add(RawSource::from(format!(
-        "{} = __webpack_exports__{export_access};\n",
-        access_with_init(&full_name_resolved, self.options.prefix.len(), false)
-      )));
-    }
-
-    Ok(Some(source.boxed()))
-  }
-
-  fn js_chunk_hash(
-    &self,
-    _ctx: PluginContext,
-    args: &mut JsChunkHashArgs,
-  ) -> PluginJsChunkHashHookOutput {
-    self.name().hash(&mut args.hasher);
-    args
+  fn apply(&self, ctx: PluginContext<&mut ApplyContext>, _options: &CompilerOptions) -> Result<()> {
+    ctx
+      .context
+      .compiler_hooks
       .compilation
-      .options
-      .output
-      .library
-      .hash(&mut args.hasher);
+      .tap(compilation::new(self));
+    ctx
+      .context
+      .compilation_hooks
+      .finish_modules
+      .tap(finish_modules::new(self));
+    ctx
+      .context
+      .compilation_hooks
+      .additional_chunk_runtime_requirements
+      .tap(additional_chunk_runtime_requirements::new(self));
     Ok(())
   }
 }
 
-#[inline]
-fn property_library(library: &Option<LibraryOptions>) -> String {
-  if let Some(library) = library {
-    if let Some(export) = &library.export {
-      return property_access(export);
-    }
+#[plugin_hook(CompilationAdditionalChunkRuntimeRequirements for AssignLibraryPlugin)]
+fn additional_chunk_runtime_requirements(
+  &self,
+  compilation: &mut Compilation,
+  chunk_ukey: &ChunkUkey,
+  runtime_requirements: &mut RuntimeGlobals,
+) -> Result<()> {
+  if self
+    .get_options_for_chunk(compilation, chunk_ukey)?
+    .is_none()
+  {
+    return Ok(());
   }
-  String::default()
+  runtime_requirements.insert(RuntimeGlobals::EXPORTS);
+  Ok(())
 }
 
-fn access_with_init(accessor: &Vec<String>, existing_length: usize, init_last: bool) -> String {
+fn access_with_init(accessor: &[String], existing_length: usize, init_last: bool) -> String {
   let base = accessor[0].clone();
   if accessor.len() == 1 && !init_last {
     return base;
@@ -182,7 +482,7 @@ fn access_with_init(accessor: &Vec<String>, existing_length: usize, init_last: b
   if existing_length > i {
     props_so_far = accessor[1..existing_length].to_vec();
     i = existing_length;
-    current.push_str(property_access(&props_so_far).as_str());
+    current.push_str(property_access(&props_so_far, 0).as_str());
   }
 
   let init_until = if init_last {
@@ -195,8 +495,8 @@ fn access_with_init(accessor: &Vec<String>, existing_length: usize, init_last: b
     props_so_far.push(accessor[i].clone());
     current = format!(
       "({current}{} = {base}{} || {{}})",
-      property_access(&vec![accessor[i].clone()]),
-      property_access(&props_so_far)
+      property_access(vec![&accessor[i]], 0),
+      property_access(&props_so_far, 0)
     );
     i += 1;
   }
@@ -204,9 +504,23 @@ fn access_with_init(accessor: &Vec<String>, existing_length: usize, init_last: b
   if i < accessor.len() {
     current = format!(
       "{current}{}",
-      property_access(&vec![accessor[accessor.len() - 1].clone()]),
+      property_access([&accessor[accessor.len() - 1]], 0),
     );
   }
 
   current
+}
+
+static KEYWORD_REGEXP: LazyLock<Regex> = LazyLock::new(|| {
+  Regex::new(r"^(await|break|case|catch|class|const|continue|debugger|default|delete|do|else|enum|export|extends|false|finally|for|function|if|implements|import|in|instanceof|interface|let|new|null|package|private|protected|public|return|super|switch|static|this|throw|try|true|typeof|var|void|while|with|yield)$").expect("should init regex")
+});
+
+static IDENTIFIER_REGEXP: LazyLock<Regex> = LazyLock::new(|| {
+  Regex::new(r"^[\p{L}\p{Nl}$_][\p{L}\p{Nl}$\p{Mn}\p{Mc}\p{Nd}\p{Pc}]*$")
+    .expect("should init regex")
+});
+
+#[inline]
+fn is_name_valid(v: &str) -> bool {
+  !KEYWORD_REGEXP.is_match(v) && IDENTIFIER_REGEXP.is_match(v)
 }

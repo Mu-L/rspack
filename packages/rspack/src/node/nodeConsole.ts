@@ -8,29 +8,42 @@
  * https://github.com/webpack/webpack/blob/main/LICENSE
  */
 
-const util = require("util");
-const truncateArgs = require("../logging/truncateArgs");
-// @ts-expect-error
-export = ({ colors, appendOnly, stream }) => {
-	// @ts-expect-error
-	let currentStatusMessage = undefined;
+import * as util from "node:util";
+import type { LoggerConsole } from "../logging/createConsoleLogger";
+import { truncateArgs } from "../logging/truncateArgs";
+
+export default function ({
+	colors,
+	appendOnly,
+	stream
+}: {
+	colors?: boolean;
+	appendOnly?: boolean;
+	stream: NodeJS.WritableStream;
+}): LoggerConsole {
+	let currentStatusMessage: string[] | undefined = undefined;
 	let hasStatusMessage = false;
 	let currentIndent = "";
 	let currentCollapsed = 0;
-	// @ts-expect-error
-	const indent = (str, prefix, colorPrefix, colorSuffix) => {
+
+	const indent = (
+		str: string,
+		prefix: string,
+		colorPrefix: string,
+		colorSuffix: string
+	): string => {
 		if (str === "") return str;
-		prefix = currentIndent + prefix;
+		const prefixWithIndent = currentIndent + prefix;
+
 		if (colors) {
 			return (
-				prefix +
+				prefixWithIndent +
 				colorPrefix +
-				str.replace(/\n/g, colorSuffix + "\n" + prefix + colorPrefix) +
+				str.replace(/\n/g, `${colorSuffix}\n${prefix}${colorPrefix}`) +
 				colorSuffix
 			);
-		} else {
-			return prefix + str.replace(/\n/g, "\n" + prefix);
 		}
+		return prefixWithIndent + str.replace(/\n/g, `\n${prefix}`);
 	};
 
 	const clearStatusMessage = () => {
@@ -41,9 +54,10 @@ export = ({ colors, appendOnly, stream }) => {
 	};
 
 	const writeStatusMessage = () => {
-		// @ts-expect-error
 		if (!currentStatusMessage) return;
-		const l = stream.columns;
+		// cannot be resolved without assertion, copy from webpack
+		// Property 'columns' does not exist on type 'WritableStream'.ts(2339)
+		const l: number = (stream as unknown as { columns: number }).columns;
 		const args = l
 			? truncateArgs(currentStatusMessage, l - 1)
 			: currentStatusMessage;
@@ -52,9 +66,11 @@ export = ({ colors, appendOnly, stream }) => {
 		stream.write(`\x1b[2K\r${coloredStr}`);
 		hasStatusMessage = true;
 	};
-	// @ts-expect-error
-	const writeColored = (prefix, colorPrefix, colorSuffix) => {
-		// @ts-expect-error
+	const writeColored = (
+		prefix: string,
+		colorPrefix: string,
+		colorSuffix: string
+	): ((...args: any[]) => void) => {
 		return (...args) => {
 			if (currentCollapsed > 0) return;
 			clearStatusMessage();
@@ -64,7 +80,7 @@ export = ({ colors, appendOnly, stream }) => {
 				colorPrefix,
 				colorSuffix
 			);
-			stream.write(str + "\n");
+			stream.write(`${str}\n`);
 			writeStatusMessage();
 		};
 	};
@@ -84,7 +100,7 @@ export = ({ colors, appendOnly, stream }) => {
 	return {
 		log: writeColored("    ", "\u001b[1m", "\u001b[22m"),
 		debug: writeColored("    ", "", ""),
-		trace: writeColored("    ", "", ""),
+		trace: writeColored("    ", "", "") as () => void,
 		info: writeColored("<i> ", "\u001b[1m\u001b[32m", "\u001b[39m\u001b[22m"),
 		warn: writeColored("<w> ", "\u001b[1m\u001b[33m", "\u001b[39m\u001b[22m"),
 		error: writeColored("<e> ", "\u001b[1m\u001b[31m", "\u001b[39m\u001b[22m"),
@@ -93,7 +109,6 @@ export = ({ colors, appendOnly, stream }) => {
 			"\u001b[1m\u001b[35m",
 			"\u001b[39m\u001b[22m"
 		),
-		// @ts-expect-error
 		group: (...args) => {
 			writeGroupMessage(...args);
 			if (currentCollapsed > 0) {
@@ -102,7 +117,6 @@ export = ({ colors, appendOnly, stream }) => {
 				currentIndent += "  ";
 			}
 		},
-		// @ts-expect-error
 		groupCollapsed: (...args) => {
 			writeGroupCollapsedMessage(...args);
 			currentCollapsed++;
@@ -112,27 +126,22 @@ export = ({ colors, appendOnly, stream }) => {
 			else if (currentIndent.length >= 2)
 				currentIndent = currentIndent.slice(0, currentIndent.length - 2);
 		},
-		// eslint-disable-next-line node/no-unsupported-features/node-builtins
-		// @ts-expect-error
+
 		profile: console.profile && (name => console.profile(name)),
-		// eslint-disable-next-line node/no-unsupported-features/node-builtins
-		// @ts-expect-error
+
 		profileEnd: console.profileEnd && (name => console.profileEnd(name)),
-		clear:
-			!appendOnly &&
-			// eslint-disable-next-line node/no-unsupported-features/node-builtins
+		clear: (!appendOnly &&
 			console.clear &&
 			(() => {
 				clearStatusMessage();
-				// eslint-disable-next-line node/no-unsupported-features/node-builtins
+
 				console.clear();
 				writeStatusMessage();
-			}),
+			})) as () => void,
 		status: appendOnly
 			? writeColored("<s> ", "", "")
-			: // @ts-expect-error
-			  (name, ...args) => {
-					args = args.filter(Boolean);
+			: (name, ...argsWithEmpty) => {
+					const args = argsWithEmpty.filter(Boolean);
 					if (name === undefined && args.length === 0) {
 						clearStatusMessage();
 						currentStatusMessage = undefined;
@@ -149,6 +158,6 @@ export = ({ colors, appendOnly, stream }) => {
 						currentStatusMessage = [name, ...args];
 						writeStatusMessage();
 					}
-			  }
+				}
 	};
-};
+}

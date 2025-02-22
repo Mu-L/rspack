@@ -1,46 +1,28 @@
 [package]
-edition    = "2021"
-license    = "MIT"
-name       = "rspack_plugin_css"
-repository = "https://github.com/web-infra-dev/rspack"
-version    = "0.1.0"
-
+description = "rspack css plugin"
+edition     = "2021"
+license     = "MIT"
+name        = "rspack_plugin_css"
+repository  = "https://github.com/web-infra-dev/rspack"
+version     = "0.2.0"
 [dependencies]
-anyhow = { workspace = true }
-async-trait = { workspace = true }
-bitflags = { workspace = true }
-data-encoding = "2.3.3"
-heck = "0.4.1"
-indexmap = { workspace = true }
-itertools = { workspace = true }
-once_cell = { workspace = true }
-paste = { workspace = true }
-preset_env_base = { workspace = true }
-rayon = { workspace = true }
-regex = { workspace = true }
-rspack_core = { path = "../rspack_core" }
-rspack_error = { path = "../rspack_error" }
-rspack_identifier = { path = "../rspack_identifier" }
-rustc-hash = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-sugar_path = { workspace = true }
-swc_core = { workspace = true, features = [
-  "css_ast",
-  "css_codegen",
-  "css_parser",
-  "css_utils",
-  "css_visit",
-  "css_visit_path",
-  "css_compat",
-  "css_modules",
-  "css_prefixer",
-  "css_minifier",
-] }
-tracing = { workspace = true }
-xxhash-rust = { workspace = true, features = ["xxh3"] }
-
-[dev-dependencies]
-hrx-parser     = "0.1.1"
-insta          = "1.29.0"
-rspack_testing = { path = "../rspack_testing" }
+async-trait           = { workspace = true }
+cow-utils             = { workspace = true }
+css-module-lexer      = { workspace = true }
+heck                  = { workspace = true }
+indexmap              = { workspace = true }
+once_cell             = { workspace = true }
+rayon                 = { workspace = true }
+regex                 = { workspace = true }
+rspack_cacheable      = { workspace = true }
+rspack_collections    = { workspace = true }
+rspack_core           = { workspace = true }
+rspack_error          = { workspace = true }
+rspack_hash           = { workspace = true }
+rspack_hook           = { workspace = true }
+rspack_plugin_runtime = { workspace = true }
+rspack_util           = { workspace = true }
+rustc-hash            = { workspace = true }
+serde_json            = { workspace = true }
+tracing               = { workspace = true }
+urlencoding           = { workspace = true }
